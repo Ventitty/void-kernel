@@ -38,7 +38,7 @@ typedef struct {
 
 extern void uart_print(const char *str);
 extern void uart_print_hex(uint32_t val);
-extern void set_cpu_private_timer(uint32_t timer_id, uint32_t cycles);
+extern uint32_t* time_tick_interrupt(uint32_t *sp);
 extern uint32_t* schedule_next_task(uint32_t *current_sp);
 extern uint32_t* scheduler_terminate_current(uint32_t *sp);
 extern uint32_t* handle_syscall(cpu_context_t *ctx);
@@ -46,6 +46,7 @@ extern uint32_t* handle_syscall(cpu_context_t *ctx);
 void interrupts_init(void);
 void interrupts_init_this_core(void);
 void interrupts_enable_line(uint8_t int_num);
+void interrupts_disable_line(uint8_t int_num);
 void interrupts_enable_global(void);
 void interrupts_disable_global(void);
 void interrupts_register_handler(uint8_t int_num, isr_handler_t handler, void *arg);

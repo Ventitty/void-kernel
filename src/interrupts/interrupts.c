@@ -26,6 +26,12 @@ void interrupts_enable_line(uint8_t int_num) {
     cpu_write_intenable(cpu_read_intenable() | (1U << int_num));
 }
 
+void interrupts_disable_line(uint8_t int_num) {
+    if (int_num >= 32) return;
+
+    cpu_write_intenable(cpu_read_intenable() & ~(1U << int_num));
+}
+
 void interrupts_register_handler(uint8_t int_num, isr_handler_t handler, void *arg) {
     if (int_num >= 32) return;
     isr_table[int_num].handler = handler;
@@ -61,23 +67,37 @@ static void panic_dump(const cpu_context_t *ctx) {
     }
 }
 
-static int dispatch_pending_interrupts(void) {
-    uint32_t active = cpu_read_pending_irq() & cpu_read_intenable();
-    if (active == 0) return 0;
+/* Bit de l'interruption du tick : traitée à part, jamais par isr_table. */
+#define TICK_IRQ_BIT (1U << TIMER0_IRQ_LINE)
 
+/* Appelle le gestionnaire de chaque ligne active de lines. Une ligne
+ * active sans gestionnaire est désactivée et signalée : une interruption
+ * de niveau inattendue se redéclencherait sinon en boucle. Retourne le
+ * nombre de gestionnaires appelés. */
+static int dispatch_lines(uint32_t lines) {
     int handled = 0;
+
     for (int i = 0; i < 32; i++) {
-        if (!(active & (1U << i))) continue;
+        if (!(lines & (1U << i))) continue;
 
         if (isr_table[i].handler != 0) {
             isr_table[i].handler(isr_table[i].arg);
-            handled = 1;
+            handled++;
+        } else {
+            interrupts_disable_line((uint8_t)i);
+            uart_print("[irq] ligne sans gestionnaire, desactivee : ");
+            uart_print_hex((uint32_t)i);
+            uart_print("\n");
         }
 
         cpu_clear_irq(1U << i);
     }
 
     return handled;
+}
+
+static uint32_t active_lines(void) {
+    return cpu_read_pending_irq() & cpu_read_intenable();
 }
 
 uint32_t* c_interrupt_handler(uint32_t *sp, uint32_t level) {
@@ -109,16 +129,18 @@ uint32_t* c_interrupt_handler(uint32_t *sp, uint32_t level) {
             return sp;
         }
 
-        if (!dispatch_pending_interrupts()) {
-            #define TICK_CYCLES 240000
-            set_cpu_private_timer(0, TICK_CYCLES);
-            return schedule_next_task(sp);
-        }
+        /* Interruptions de niveau 1 : périphériques d'abord, puis le tick,
+         * qui peut changer de tâche et doit donc passer en dernier. */
+        uint32_t active = active_lines();
+        dispatch_lines(active & ~TICK_IRQ_BIT);
 
+        if (active & TICK_IRQ_BIT) {
+            return time_tick_interrupt(sp);
+        }
         return sp;
     }
 
-    if (!dispatch_pending_interrupts()) {
+    if (dispatch_lines(active_lines() & ~TICK_IRQ_BIT) == 0) {
         panic_dump(ctx);
     }
 

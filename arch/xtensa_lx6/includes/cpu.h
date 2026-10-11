@@ -100,6 +100,29 @@ CPU_INLINE void cpu_clear_irq(uint32_t mask) {
     __asm__ volatile ("wsr %0, intclear\n\trsync" :: "r"(mask));
 }
 
+/* ---- Compteur de cycles et timer 0 du cœur ------------------------------
+ * CCOUNT s'incrémente à chaque cycle CPU et reboucle tous les 2^32 cycles.
+ * Quand CCOUNT atteint CCOMPARE0, l'interruption timer 0 (ligne 6) est
+ * levée ; écrire CCOMPARE0 l'acquitte. Chaque cœur a ses propres
+ * registres. Comparer des valeurs de CCOUNT par différence signée :
+ * (int32_t)(a - b) < 0 signifie "a avant b", rebouclage compris. */
+
+CPU_INLINE uint32_t cpu_read_ccount(void) {
+    uint32_t v;
+    __asm__ volatile ("rsr %0, ccount" : "=r"(v));
+    return v;
+}
+
+CPU_INLINE uint32_t cpu_read_ccompare0(void) {
+    uint32_t v;
+    __asm__ volatile ("rsr %0, ccompare0" : "=r"(v));
+    return v;
+}
+
+CPU_INLINE void cpu_write_ccompare0(uint32_t v) {
+    __asm__ volatile ("wsr %0, ccompare0\n\trsync" :: "r"(v));
+}
+
 /* ---- Barrières ---------------------------------------------------------- */
 
 /* Barrière mémoire : toutes les écritures précédentes sont terminées. */

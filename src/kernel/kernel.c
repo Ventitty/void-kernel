@@ -1,37 +1,5 @@
 #include "src/kernel/kernel.h"
 
-static spinlock_t uart_lock = SPINLOCK_INIT;
-
-static void uart_write_str(const char *str) {
-    while (*str != '\0') {
-        if (*str == '\n') {
-            uart0_putchar('\r');
-        }
-        uart0_putchar(*str);
-        str++;
-    }
-}
-
-void uart_print(const char *str) {
-    spinlock_acquire(&uart_lock);
-    uart_write_str(str);
-    spinlock_release(&uart_lock);
-}
-
-void uart_print_hex(uint32_t val) {
-    const char hex_chars[] = "0123456789ABCDEF";
-    char buf[11];
-
-    buf[0] = '0';
-    buf[1] = 'x';
-    for (int i = 0; i < 8; i++) {
-        buf[2 + i] = hex_chars[(val >> (28 - 4 * i)) & 0xF];
-    }
-    buf[10] = '\0';
-
-    uart_print(buf);
-}
-
 void echo(void) {
     UART0_CONF0_REG |= UART_RXFIFO_RST;
     UART0_CONF0_REG &= ~UART_RXFIFO_RST;
@@ -85,6 +53,7 @@ void kernel_main(void) {
     wdt_disable_all();
     mm_init();
     interrupts_init();
+    time_init();          /* avant le second cœur : il arme son tick avec */
     scheduler_init();
     start_app_cpu();
     led_init();

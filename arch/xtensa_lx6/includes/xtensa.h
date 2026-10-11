@@ -58,8 +58,10 @@
 
 /* PS.UM (User Mode) : bit 5, vérifié contre xtensa/corebits.h officiel. */
 #define PS_UM_MASK 0x00000020u
+/* PS.EXCM : bit 4, à 1 pendant le traitement d'une exception ou d'une
+ * interruption de niveau 1. */
+#define PS_EXCM_MASK 0x00000010u
 
-#define TICK_CYCLES 240000
 #define TIMER0_IRQ_LINE 6
 
 /* Pile de chaque tâche. Pire consommation mesurée (analyse statique

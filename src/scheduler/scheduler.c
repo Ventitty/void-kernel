@@ -1,6 +1,8 @@
 #include "src/scheduler/scheduler.h"
 #include "src/utils/utils.h"
 #include "arch/xtensa_lx6/includes/cpu.h"
+#include "src/time/time.h"
+#include "src/memory_manager/task_memory.h"
 
 static spinlock_t tasks_lock = SPINLOCK_INIT;
 
@@ -12,6 +14,9 @@ static int      next_id    = 0;
 static task_t *volatile current_task[2] = { NULL, NULL };
 static task_t *idle_task[2] = { NULL, NULL };
 static task_t *retired[2]   = { NULL, NULL };
+
+/* Tâches endormies, triées par échéance croissante (sous tasks_lock). */
+static task_t *sleep_list = NULL;
 
 static void stack_overflow_halt(const task_t *t, uint32_t sp) {
     uart_print("\n[noyau] DEBORDEMENT DE PILE : tache ");
@@ -141,7 +146,11 @@ static task_t *task_alloc(void (*entry)(void), uint8_t pinned_core, int user_mod
     ctx->a0       = (uint32_t)task_exit;
     ctx->exccause = EXCCAUSE_LEVEL1_INTERRUPT;
 
-    uint32_t ps = cpu_read_ps();
+    /* PS de départ : celui du créateur, sans son niveau d'interruption ni
+     * EXCM. Une tâche créée alors que le créateur tient un spinlock (niveau
+     * 3) ou traite une interruption ne doit pas hériter de ce masquage :
+     * elle tournerait sans jamais être préemptée par le tick. */
+    uint32_t ps = cpu_read_ps() & ~(PS_INTLEVEL_MASK | PS_EXCM_MASK);
     if (user_mode) ps |= PS_UM_MASK;
     ctx->ps = ps;
 
@@ -152,10 +161,18 @@ static task_t *task_alloc(void (*entry)(void), uint8_t pinned_core, int user_mod
     t->pinned_core = pinned_core;
     t->running_on  = TASK_ANY_CORE;
     t->id          = -1;
+
+    t->mem[0].start    = (uint32_t)stack;
+    t->mem[0].end      = (uint32_t)stack + stack_size;
+    t->mem[0].writable = 1;
+    t->mem_count       = 1;
     return t;
 }
 
 static void task_free(task_t *t) {
+    /* Mémoire obtenue par VOID_SYS_MEM_ALLOC et jamais rendue : récupérée
+     * ici, un programme qui oublie ses free() ne fait pas fuir le tas. */
+    task_mem_release_all(t);
     unmap(t->stack);
     unmap(t);
 }
@@ -180,9 +197,17 @@ void scheduler_init(void) {
     }
 }
 
-static int task_create_common(void (*entry)(void), uint8_t pinned_core, int user_mode) {
+static int task_create_common(void (*entry)(void), uint8_t pinned_core, int user_mode,
+                              const task_mem_range_t *ranges, uint32_t count) {
+    if (count > TASK_MAX_MEM_RANGES - 1u) return -1;
+    if (count > 0 && ranges == NULL) return -1;
+
     task_t *t = task_alloc(entry, pinned_core, user_mode, TASK_STACK_SIZE);
     if (t == NULL) return -1;
+
+    for (uint32_t i = 0; i < count; i++) {
+        t->mem[t->mem_count++] = ranges[i];
+    }
 
     spinlock_acquire(&tasks_lock);
     t->id = next_id;
@@ -192,159 +217,237 @@ static int task_create_common(void (*entry)(void), uint8_t pinned_core, int user
     spinlock_release(&tasks_lock);
 
     return id;
-}
+                              }
 
-int task_create(void (*entry)(void)) {
-    return task_create_common(entry, TASK_ANY_CORE, 0);
-}
+                              int task_create(void (*entry)(void)) {
+                                  return task_create_common(entry, TASK_ANY_CORE, 0, NULL, 0);
+                              }
 
-int task_create_pinned(void (*entry)(void), uint8_t core) {
-    if (core > 1) return -1;
-    return task_create_common(entry, core, 0);
-}
+                              int task_create_pinned(void (*entry)(void), uint8_t core) {
+                                  if (core > 1) return -1;
+                                  return task_create_common(entry, core, 0, NULL, 0);
+                              }
 
-int task_create_user(void (*entry)(void)) {
-    return task_create_common(entry, TASK_ANY_CORE, 1);
-}
+                              int task_create_user(void (*entry)(void)) {
+                                  return task_create_common(entry, TASK_ANY_CORE, 1, NULL, 0);
+                              }
 
-int task_create_user_pinned(void (*entry)(void), uint8_t core) {
-    if (core > 1) return -1;
-    return task_create_common(entry, core, 1);
-}
+                              int task_create_user_pinned(void (*entry)(void), uint8_t core) {
+                                  if (core > 1) return -1;
+                                  return task_create_common(entry, core, 1, NULL, 0);
+                              }
 
-uint32_t *schedule_next_task(uint32_t *current_sp) {
-    uint32_t core = cpu_core_id();
-    task_t *cur = current_task[core];
+                              int task_create_user_mem(void (*entry)(void), const task_mem_range_t *ranges, uint32_t count) {
+                                  return task_create_common(entry, TASK_ANY_CORE, 1, ranges, count);
+                              }
 
-    stack_check_outgoing(cur, current_sp);
+                              uint32_t *schedule_next_task(uint32_t *current_sp) {
+                                  uint32_t core = cpu_core_id();
+                                  task_t *cur = current_task[core];
 
-    task_t *to_free = retired[core];
-    retired[core] = NULL;
+                                  stack_check_outgoing(cur, current_sp);
 
-    spinlock_acquire(&tasks_lock);
+                                  task_t *to_free = retired[core];
+                                  retired[core] = NULL;
 
-    if (cur != NULL) {
-        cur->sp = current_sp;
-        cur->running_on = TASK_ANY_CORE;
-        if (cur->state == TASK_RUNNING) cur->state = TASK_READY;
-    }
+                                  spinlock_acquire(&tasks_lock);
 
-    task_t *next = pick_next_locked(core);
-    if (next == NULL) next = idle_task[core];
+                                  if (cur != NULL) {
+                                      cur->sp = current_sp;
+                                      cur->running_on = TASK_ANY_CORE;
+                                      if (cur->state == TASK_RUNNING) cur->state = TASK_READY;
+                                  }
 
-    next->state = TASK_RUNNING;
-    next->running_on = (uint8_t)core;
-    current_task[core] = next;
+                                  task_t *next = pick_next_locked(core);
+                                  if (next == NULL) next = idle_task[core];
 
-    if (cur != NULL && cur->state == TASK_ZOMBIE) {
-        retired[core] = cur;
-    }
+                                  next->state = TASK_RUNNING;
+                                  next->running_on = (uint8_t)core;
+                                  current_task[core] = next;
 
-    uint32_t *new_sp = next->sp;
-    spinlock_release(&tasks_lock);
+                                  if (cur != NULL && cur->state == TASK_ZOMBIE) {
+                                      retired[core] = cur;
+                                  }
 
-    if (to_free != NULL) task_free(to_free);
+                                  uint32_t *new_sp = next->sp;
+                                  spinlock_release(&tasks_lock);
 
-    return new_sp;
-}
+                                  if (to_free != NULL) task_free(to_free);
 
-uint32_t *scheduler_terminate_current(uint32_t *sp) {
-    uint32_t core = cpu_core_id();
+                                  return new_sp;
+                              }
 
-    spinlock_acquire(&tasks_lock);
-    task_t *cur = current_task[core];
-    if (cur != NULL && cur != idle_task[core]) {
-        mark_zombie_locked(cur);
-    }
-    spinlock_release(&tasks_lock);
+                              uint32_t *scheduler_terminate_current(uint32_t *sp) {
+                                  uint32_t core = cpu_core_id();
 
-    return schedule_next_task(sp);
-}
+                                  spinlock_acquire(&tasks_lock);
+                                  task_t *cur = current_task[core];
+                                  if (cur != NULL && cur != idle_task[core]) {
+                                      mark_zombie_locked(cur);
+                                  }
+                                  spinlock_release(&tasks_lock);
 
-void scheduler_start(void) {
-    uint32_t core = cpu_core_id();
+                                  return schedule_next_task(sp);
+                              }
 
-    interrupts_init_this_core();
+                              void scheduler_start(void) {
+                                  uint32_t core = cpu_core_id();
 
-    current_task[core] = NULL;
+                                  interrupts_init_this_core();
 
-    interrupts_enable_line(TIMER0_IRQ_LINE);
-    set_cpu_private_timer(0, TICK_CYCLES);
-    interrupts_enable_global();
+                                  current_task[core] = NULL;
 
-    while (1) cpu_wait_irq();
-}
+                                  time_start_this_core();
+                                  interrupts_enable_global();
 
-uint32_t get_core_id(void) {
-    return cpu_core_id();
-}
+                                  while (1) cpu_wait_irq();
+                              }
 
-task_t *scheduler_current_task(void) {
-    uint32_t ps = cpu_irq_mask_all();
-    uint32_t core = cpu_core_id();
-    task_t *t = current_task[core];
-    cpu_write_ps(ps);
+                              uint32_t get_core_id(void) {
+                                  return cpu_core_id();
+                              }
 
-    if (t == idle_task[0] || t == idle_task[1]) return NULL;
-    return t;
-}
+                              task_t *scheduler_current_task(void) {
+                                  uint32_t ps = cpu_irq_mask_all();
+                                  uint32_t core = cpu_core_id();
+                                  task_t *t = current_task[core];
+                                  cpu_write_ps(ps);
 
-int scheduler_current_task_id(void) {
-    task_t *t = scheduler_current_task();
-    return t ? t->id : -1;
-}
+                                  if (t == idle_task[0] || t == idle_task[1]) return NULL;
+                                  return t;
+                              }
 
-task_t *scheduler_mark_blocked_self(void) {
-    task_t *me = scheduler_current_task();
-    if (me == NULL) return NULL;
+                              int scheduler_current_task_id(void) {
+                                  task_t *t = scheduler_current_task();
+                                  return t ? t->id : -1;
+                              }
 
-    spinlock_acquire(&tasks_lock);
-    me->state = TASK_BLOCKED;
-    spinlock_release(&tasks_lock);
+                              task_t *scheduler_mark_blocked_self(void) {
+                                  task_t *me = scheduler_current_task();
+                                  if (me == NULL) return NULL;
 
-    return me;
-}
+                                  spinlock_acquire(&tasks_lock);
+                                  me->state = TASK_BLOCKED;
+                                  spinlock_release(&tasks_lock);
 
-void scheduler_yield_blocked(task_t *me) {
-    if (me == NULL) return;
+                                  return me;
+                              }
 
-    while (me->state == TASK_BLOCKED) {
-        cpu_wait_irq();
-    }
-}
+                              void scheduler_yield_blocked(task_t *me) {
+                                  if (me == NULL) return;
 
-void scheduler_block_current(void) {
-    scheduler_yield_blocked(scheduler_mark_blocked_self());
-}
+                                  while (me->state == TASK_BLOCKED) {
+                                      cpu_wait_irq();
+                                  }
+                              }
 
-void scheduler_unblock(task_t *t) {
-    if (t == NULL) return;
+                              void scheduler_block_current(void) {
+                                  scheduler_yield_blocked(scheduler_mark_blocked_self());
+                              }
 
-    spinlock_acquire(&tasks_lock);
-    if (t->state == TASK_BLOCKED) {
-        t->state = TASK_READY;
-    }
-    spinlock_release(&tasks_lock);
-}
+                              /* ---- Sommeil ------------------------------------------------------------ */
 
-uint32_t scheduler_stack_unused(int task_id) {
-    uint32_t n = 0;
+                              static int tick_before(uint32_t a, uint32_t b) {
+                                  return (int32_t)(a - b) < 0;
+                              }
 
-    spinlock_acquire(&tasks_lock);
-    task_t *t = find_locked(task_id);
-    if (t != NULL) {
-        const volatile uint32_t *p = (const volatile uint32_t *)t->stack;
-        uint32_t words = t->stack_size / 4u;
-        while (n < words && p[n] == STACK_FILL) n++;
-    }
-    spinlock_release(&tasks_lock);
+                              static void sleep_insert_locked(task_t *t, uint32_t wake_tick) {
+                                  t->wake_tick = wake_tick;
+                                  t->sleeping  = 1;
 
-    return n * 4u;
-}
+                                  /* Après les dormeurs de même échéance : réveil dans l'ordre d'arrivée. */
+                                  task_t **link = &sleep_list;
+                                  while (*link != NULL && !tick_before(wake_tick, (*link)->wake_tick)) {
+                                      link = &(*link)->sleep_next;
+                                  }
+                                  t->sleep_next = *link;
+                                  *link = t;
+                              }
 
-uint32_t scheduler_task_count(void) {
-    spinlock_acquire(&tasks_lock);
-    uint32_t n = task_count;
-    spinlock_release(&tasks_lock);
-    return n;
-}
+                              static void sleep_remove_locked(task_t *t) {
+                                  if (!t->sleeping) return;
+
+                                  for (task_t **link = &sleep_list; *link != NULL; link = &(*link)->sleep_next) {
+                                      if (*link == t) {
+                                          *link = t->sleep_next;
+                                          break;
+                                      }
+                                  }
+                                  t->sleep_next = NULL;
+                                  t->sleeping   = 0;
+                              }
+
+                              task_t *scheduler_sleep_prepare(uint32_t wake_tick) {
+                                  task_t *me = scheduler_current_task();
+                                  if (me == NULL) return NULL;
+
+                                  spinlock_acquire(&tasks_lock);
+                                  sleep_insert_locked(me, wake_tick);
+                                  me->state = TASK_BLOCKED;
+                                  spinlock_release(&tasks_lock);
+
+                                  return me;
+                              }
+
+                              uint32_t *scheduler_sleep_from_syscall(uint32_t *sp, uint32_t wake_tick) {
+                                  uint32_t core = cpu_core_id();
+
+                                  spinlock_acquire(&tasks_lock);
+                                  task_t *cur = current_task[core];
+                                  if (cur != NULL && cur != idle_task[core]) {
+                                      sleep_insert_locked(cur, wake_tick);
+                                      cur->state = TASK_BLOCKED;
+                                  }
+                                  spinlock_release(&tasks_lock);
+
+                                  /* La tâche étant bloquée, schedule_next_task en élit une autre. */
+                                  return schedule_next_task(sp);
+                              }
+
+                              void scheduler_wake_sleepers(uint32_t now) {
+                                  spinlock_acquire(&tasks_lock);
+                                  /* Liste triée : on s'arrête au premier dormeur pas encore échu. */
+                                  while (sleep_list != NULL && !tick_before(now, sleep_list->wake_tick)) {
+                                      task_t *t = sleep_list;
+                                      sleep_list = t->sleep_next;
+                                      t->sleep_next = NULL;
+                                      t->sleeping   = 0;
+                                      if (t->state == TASK_BLOCKED) t->state = TASK_READY;
+                                  }
+                                  spinlock_release(&tasks_lock);
+                              }
+
+                              void scheduler_unblock(task_t *t) {
+                                  if (t == NULL) return;
+
+                                  spinlock_acquire(&tasks_lock);
+                                  /* Une tâche réveillée par une autre voie quitte la liste des dormeurs :
+                                   * utile dès que les attentes auront un délai d'expiration. */
+                                  sleep_remove_locked(t);
+                                  if (t->state == TASK_BLOCKED) {
+                                      t->state = TASK_READY;
+                                  }
+                                  spinlock_release(&tasks_lock);
+                              }
+
+                              uint32_t scheduler_stack_unused(int task_id) {
+                                  uint32_t n = 0;
+
+                                  spinlock_acquire(&tasks_lock);
+                                  task_t *t = find_locked(task_id);
+                                  if (t != NULL) {
+                                      const volatile uint32_t *p = (const volatile uint32_t *)t->stack;
+                                      uint32_t words = t->stack_size / 4u;
+                                      while (n < words && p[n] == STACK_FILL) n++;
+                                  }
+                                  spinlock_release(&tasks_lock);
+
+                                  return n * 4u;
+                              }
+
+                              uint32_t scheduler_task_count(void) {
+                                  spinlock_acquire(&tasks_lock);
+                                  uint32_t n = task_count;
+                                  spinlock_release(&tasks_lock);
+                                  return n;
+                              }
