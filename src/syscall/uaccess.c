@@ -1,9 +1,5 @@
 #include "src/syscall/uaccess.h"
-#include "src/memory_manager/task_memory.h"
 
-/* Zone de la tâche contenant addr : une zone déclarée à sa création (pile
- * comprise) ou un bloc alloué par VOID_SYS_MEM_ALLOC (inscriptible).
- * Retourne 1 et renseigne *end et *writable si trouvée, 0 sinon. */
 static int region_of(const task_t *t, uint32_t addr, uint32_t *end, int *writable) {
     for (uint32_t i = 0; i < t->mem_count; i++) {
         if (addr >= t->mem[i].start && addr < t->mem[i].end) {
@@ -42,7 +38,6 @@ int uaccess_strlen(const task_t *t, const char *s, uint32_t max) {
     int writable;
     if (!region_of(t, (uint32_t)s, &end, &writable)) return -1;
 
-    /* Jamais de lecture au-delà de la zone : le '\0' doit s'y trouver. */
     uint32_t room = end - (uint32_t)s;
     if (room > max) room = max;
 

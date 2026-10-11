@@ -6,6 +6,8 @@
 #include "arch/xtensa_lx6/includes/cpu.h"
 #include "src/scheduler/spinlock.h"
 
+#define TICK_IRQ_BIT (1U << TIMER0_IRQ_LINE)
+
 typedef void (*isr_handler_t)(void *arg);
 
 typedef struct {

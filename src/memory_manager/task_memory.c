@@ -1,6 +1,4 @@
 #include "src/memory_manager/task_memory.h"
-#include "src/memory_manager/memory.h"
-#include "src/utils/utils.h"
 
 void *task_mem_alloc(task_t *t, uint32_t size) {
     if (t == NULL || size == 0) return NULL;
@@ -14,8 +12,6 @@ void *task_mem_alloc(task_t *t, uint32_t size) {
         return NULL;
     }
 
-    /* Le tas réutilise des blocs libérés : ne pas exposer leur ancien
-     * contenu (données du noyau ou d'une autre tâche). */
     memset(block, 0, size);
 
     node->start = (uint32_t)block;

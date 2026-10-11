@@ -67,13 +67,6 @@ static void panic_dump(const cpu_context_t *ctx) {
     }
 }
 
-/* Bit de l'interruption du tick : traitée à part, jamais par isr_table. */
-#define TICK_IRQ_BIT (1U << TIMER0_IRQ_LINE)
-
-/* Appelle le gestionnaire de chaque ligne active de lines. Une ligne
- * active sans gestionnaire est désactivée et signalée : une interruption
- * de niveau inattendue se redéclencherait sinon en boucle. Retourne le
- * nombre de gestionnaires appelés. */
 static int dispatch_lines(uint32_t lines) {
     int handled = 0;
 
@@ -129,8 +122,6 @@ uint32_t* c_interrupt_handler(uint32_t *sp, uint32_t level) {
             return sp;
         }
 
-        /* Interruptions de niveau 1 : périphériques d'abord, puis le tick,
-         * qui peut changer de tâche et doit donc passer en dernier. */
         uint32_t active = active_lines();
         dispatch_lines(active & ~TICK_IRQ_BIT);
 
