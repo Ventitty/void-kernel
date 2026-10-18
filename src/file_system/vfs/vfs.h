@@ -14,6 +14,9 @@
 #define VFS_O_TRUNC  0x08
 #define VFS_O_APPEND 0x10
 
+/* Longueur maximale d'un chemin pour vfs_mkdir_p sur la carte SD. */
+#define VFS_PATH_MAX 256
+
 #define VFS_SEEK_SET 0
 #define VFS_SEEK_CUR 1
 #define VFS_SEEK_END 2

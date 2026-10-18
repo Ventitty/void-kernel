@@ -1,5 +1,8 @@
 #include "src/file_system/vfs/vfs.h"
 
+/* vfs_open passe ses options telles quelles à fat32_open. */
+typedef char vfs_fat32_flags_match[(VFS_O_READ == FAT32_O_READ && VFS_O_WRITE == FAT32_O_WRITE && VFS_O_CREATE == FAT32_O_CREATE && VFS_O_TRUNC == FAT32_O_TRUNC && VFS_O_APPEND == FAT32_O_APPEND) ? 1 : -1];
+
 static vfs_dev_t  *dev_list = NULL;
 static spinlock_t  dev_lock = SPINLOCK_INIT;
 
@@ -82,12 +85,12 @@ vfs_file_t *vfs_open(const char *path, int flags) {
             backend = VFS_BACKEND_DEV;
         } else {
             if (dev_shadows(path)) return NULL;
-                handle = ram_fs_open(path, flags);
+            handle = ram_fs_open(path, flags);
             backend = VFS_BACKEND_RAM;
         }
     } else {
-        if (flags & (VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC | VFS_O_APPEND)) return NULL;
-        handle = fat32_open(path);
+        /* Les options VFS_O_* ont les mêmes valeurs que FAT32_O_*. */
+        handle = fat32_open(path, flags);
         backend = VFS_BACKEND_FAT32;
     }
     if (handle == NULL) return NULL;
@@ -128,7 +131,8 @@ int vfs_write(vfs_file_t *file, const void *buf, uint32_t len) {
         return d->write ? d->write(buf, len) : -1;
     }
     if (file->backend == VFS_BACKEND_RAM) return ram_fs_write((ram_fs_file_t *)file->handle, buf, len);
-    return -1;
+    int n = fat32_write((fat32_file_t *)file->handle, buf, len);
+    return n < 0 ? -1 : n;
 }
 
 int vfs_seek(vfs_file_t *file, int32_t offset, int whence) {
@@ -183,23 +187,51 @@ int vfs_is_dir(const char *path) {
 }
 
 int vfs_mkdir(const char *path) {
-    if (!is_valid(path) || !is_ram_path(path) || dev_shadows(path)) return -1;
+    if (!is_valid(path) || is_root(path) || dev_shadows(path)) return -1;
+    if (!is_ram_path(path)) return fat32_mkdir(path) == FAT32_OK ? 0 : -1;
     return ram_fs_mkdir(path);
 }
 
+/* Crée chaque dossier du chemin manquant sur la carte, comme mkdir -p. */
+static int fat32_mkdir_p(const char *path) {
+    char partial[VFS_PATH_MAX];
+    uint32_t len = (uint32_t)strlen(path);
+    if (len >= sizeof(partial)) return -1;
+
+    for (uint32_t i = 1; i <= len; i++) {
+        if (path[i] != '/' && path[i] != '\0') continue;
+        if (path[i - 1] == '/') continue;              /* séparateurs multiples */
+
+            memcpy(partial, path, i);
+        partial[i] = '\0';
+
+        int r = fat32_mkdir(partial);
+        if (r == FAT32_ERR_EXIST) {
+            int dir = 0;
+            if (fat32_stat(partial, NULL, &dir) != FAT32_OK || !dir) return -1;
+        } else if (r != FAT32_OK) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int vfs_mkdir_p(const char *path) {
-    if (!is_valid(path) || !is_ram_path(path) || dev_shadows(path)) return -1;
+    if (!is_valid(path) || is_root(path) || dev_shadows(path)) return -1;
+    if (!is_ram_path(path)) return fat32_mkdir_p(path);
     return ram_fs_mkdir_p(path);
 }
 
 int vfs_rmdir(const char *path) {
-    if (!is_valid(path) || !is_ram_path(path) || is_mount_point(path) || dev_shadows(path)) return -1;
+    if (!is_valid(path) || is_root(path) || is_mount_point(path) || dev_shadows(path)) return -1;
+    if (!is_ram_path(path)) return fat32_rmdir(path) == FAT32_OK ? 0 : -1;
     return ram_fs_rmdir(path);
 }
 
 int vfs_unlink(const char *path) {
     /* Les périphériques sont permanents (voir le registre plus haut). */
-    if (!is_valid(path) || !is_ram_path(path) || is_mount_point(path) || dev_shadows(path)) return -1;
+    if (!is_valid(path) || is_root(path) || is_mount_point(path) || dev_shadows(path)) return -1;
+    if (!is_ram_path(path)) return fat32_unlink(path) == FAT32_OK ? 0 : -1;
     return ram_fs_unlink(path);
 }
 

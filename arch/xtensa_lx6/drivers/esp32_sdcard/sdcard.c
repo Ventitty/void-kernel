@@ -299,11 +299,9 @@ int sd_write_block(uint32_t block_addr, const uint8_t *buf) {
     tx[token_pos + 1 + SD_BLOCK_SIZE + 1] = 0xFF;
     tx[token_pos + 1 + SD_BLOCK_SIZE + 2] = 0xFF;
 
-    uart_print("[sd][diag] write: avant sd_cs_select/xfer...\n");
     sd_cs_select();
     sd_xfer_chunks(tx, rx, total);
     sd_cs_deselect();
-    uart_print("[sd][diag] write: transfert termine.\n");
 
     int r1_pos = scan_response(rx, 6, 6 + R1_WAIT_BYTES);
     int ret = -1;
@@ -313,25 +311,31 @@ int sd_write_block(uint32_t block_addr, const uint8_t *buf) {
             ret = 0;
         }
     }
+    #ifdef SD_DEBUG
     uart_print("[sd][diag] write: r1_pos="); uart_print_hex((uint32_t)r1_pos);
     uart_print(" ret="); uart_print_hex((uint32_t)ret); uart_print("\n");
+    #endif
 
     unmap(tx);
     unmap(rx);
 
     if (ret != 0) return -1;
 
-    uart_print("[sd][diag] write: attente busy...\n");
-    for (int tries = 0; tries < 5000; tries++) {
+    /* La carte tient MISO à 0 tant qu'elle programme le bloc. La norme SD
+     * autorise jusqu'à 250 ms (500 ms pour les SDXC) : délai mesuré en
+     * temps réel plutôt qu'en nombre d'interrogations, qui dépendrait de
+     * la fréquence du CPU et du SPI. */
+    const uint32_t budget = (time_cpu_hz() / 1000u) * SD_WRITE_BUSY_TIMEOUT_MS;
+    const uint32_t start = cpu_read_ccount();
+    do {
         uint8_t poll_tx[1] = { 0xFF };
         uint8_t poll_rx[1] = { 0 };
         sd_xfer_cmd(poll_tx, poll_rx, 1);
-        if (poll_rx[0] != 0x00) {
-            uart_print("[sd][diag] write: busy termine apres "); uart_print_hex((uint32_t)tries);
-            uart_print(" tentatives.\n");
-            return 0;
-        }
-    }
-    uart_print("[sd][diag] write: TIMEOUT busy (5000 tentatives).\n");
-    return -1;
+        if (poll_rx[0] != 0x00) return 0;
+    } while ((uint32_t)(cpu_read_ccount() - start) < budget);
+
+        #ifdef SD_DEBUG
+        uart_print("[sd][diag] write: TIMEOUT busy.\n");
+        #endif
+        return -1;
 }
