@@ -8,16 +8,6 @@
 
 #define RAM_FS_MAX_NAME 32
 
-#define RAM_FS_O_READ   0x01
-#define RAM_FS_O_WRITE  0x02
-#define RAM_FS_O_CREATE 0x04
-#define RAM_FS_O_TRUNC  0x08
-#define RAM_FS_O_APPEND 0x10
-
-#define RAM_FS_SEEK_SET 0
-#define RAM_FS_SEEK_CUR 1
-#define RAM_FS_SEEK_END 2
-
 typedef enum {
     RAM_FS_TYPE_FILE   = 0,
     RAM_FS_TYPE_DIR    = 1,
@@ -36,24 +26,29 @@ typedef struct ram_fs_node {
     uint32_t capacity;
 } ram_fs_node_t;
 
-struct ram_fs_file {
-    ram_fs_node_t *node;
-    uint32_t pos;
-};
-
-typedef struct ram_fs_file ram_fs_file_t;
-
 extern void uart_print(const char *str);
 extern void uart_print_hex(uint32_t val);
 
 void ram_fs_init(void);
-ram_fs_file_t *ram_fs_open(const char *path, int flags);
 
-void ram_fs_close(ram_fs_file_t *file);
-int  ram_fs_read(ram_fs_file_t *file, void *buf, uint32_t len);
-int  ram_fs_write(ram_fs_file_t *file, const void *buf, uint32_t len);
-int  ram_fs_seek(ram_fs_file_t *file, int32_t offset, int whence);
-uint32_t ram_fs_size(ram_fs_file_t *file);
+/* Accès aux fichiers par chemin, sans ouverture ni position : un fichier
+ * se lit et s'écrit en entier.
+ *
+ * ram_fs_read : copie tout le fichier dans buf. Retourne sa taille, ou -1
+ *   si le chemin n'est pas un fichier ou si len est plus petit que le
+ *   fichier (pas de lecture partielle).
+ * ram_fs_write : remplace tout le contenu du fichier par les len octets
+ *   de buf. Le fichier est créé s'il n'existe pas (son dossier doit
+ *   exister) ; len = 0 le vide. Retourne len, ou -1.
+ * ram_fs_append : ajoute len octets à la fin (fichier créé s'il n'existe
+ *   pas). Retourne len, ou -1.
+ * ram_fs_truncate : fixe la taille du fichier (agrandi avec des zéros).
+ * ram_fs_stat : taille et nature d'une entrée ; 0, ou -1 si absente. */
+int ram_fs_read(const char *path, void *buf, uint32_t len);
+int ram_fs_write(const char *path, const void *buf, uint32_t len);
+int ram_fs_append(const char *path, const void *buf, uint32_t len);
+int ram_fs_truncate(const char *path, uint32_t size);
+int ram_fs_stat(const char *path, uint32_t *out_size, int *out_is_dir);
 
 int ram_fs_unlink(const char *path);
 

@@ -72,41 +72,32 @@ static void test_print_dec(uint32_t v) {
     uart_print(utoa_base(v, buf, 10));
 }
 
-/* Écrit len octets d'un coup ; retourne 1 si tout est passé. */
-static int test_ecrire(const char *chemin, int options, const char *texte, uint32_t len) {
-    vfs_file_t *f = vfs_open(chemin, options);
-    if (f == NULL) return 0;
-    int n = vfs_write(f, texte, len);
-    vfs_close(f);
-    return n == (int)len;
+/* Le fichier (créé s'il n'existe pas) contient ensuite exactement texte.
+ * 1 si tout est passé. */
+static int test_ecrire(const char *chemin, const char *texte, uint32_t len) {
+    return vfs_write(chemin, texte, len) == (int)len;
 }
 
-/* Relit le fichier dans buf (au plus max octets) ; retourne la taille lue
- * ou -1. */
+/* Ajoute texte en fin de fichier (créé s'il n'existe pas). 1 si réussi. */
+static int test_ajouter(const char *chemin, const char *texte, uint32_t len) {
+    return vfs_append(chemin, texte, len) == (int)len;
+}
+
+/* Relit tout le fichier dans buf ; taille, ou -1 s'il dépasse max. */
 static int test_relire(const char *chemin, char *buf, uint32_t max) {
-    vfs_file_t *f = vfs_open(chemin, VFS_O_READ);
-    if (f == NULL) return -1;
-    uint32_t total = 0;
-    while (total < max) {
-        int n = vfs_read(f, buf + total, max - total);
-        if (n <= 0) break;
-        total += (uint32_t)n;
-    }
-    vfs_close(f);
-    return (int)total;
+    return vfs_read(chemin, buf, max);
 }
 
 static void test_ecriture_fichier(void) {
     static const char ligne1[] = "Bonjour depuis voidOS !\n";
-    static const char ligne2[] = "Deuxieme ligne, ajoutee en fin de fichier.\n";
+    static const char ligne2[] = "Deuxieme ligne, ajoutee en fin de test test test test fichier.\n";
     static char lu[128];
     uint32_t taille = 0;
 
     uart_print("\n--- test d'ecriture sur la carte SD ---\n");
 
-    /* 1. Création (ou remise à zéro) puis écriture */
-    test_resultat(test_ecrire(TEST_FICHIER, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC,
-                              ligne1, sizeof(ligne1) - 1),
+    /* 1. Création ou remplacement complet du contenu */
+    test_resultat(test_ecrire(TEST_FICHIER, ligne1, sizeof(ligne1) - 1),
                   "creation et ecriture de " TEST_FICHIER);
 
     /* 2. Taille et contenu relus */
@@ -117,8 +108,7 @@ static void test_ecriture_fichier(void) {
                   "relecture identique");
 
     /* 3. Ajout en fin */
-    test_resultat(test_ecrire(TEST_FICHIER, VFS_O_WRITE | VFS_O_APPEND,
-                              ligne2, sizeof(ligne2) - 1),
+    test_resultat(test_ajouter(TEST_FICHIER, ligne2, sizeof(ligne2) - 1),
                   "ajout d'une ligne en fin de fichier");
     n = test_relire(TEST_FICHIER, lu, sizeof(lu));
     test_resultat(n == (int)(sizeof(ligne1) + sizeof(ligne2) - 2) &&
@@ -133,8 +123,7 @@ static void test_ecriture_fichier(void) {
     strcpy(journal, "demarrage a ");
     strcat(journal, utoa_base((uint32_t)time_uptime_ms(), nombre, 10));
     strcat(journal, " ms\n");
-    test_resultat(test_ecrire(TEST_JOURNAL, VFS_O_WRITE | VFS_O_CREATE | VFS_O_APPEND,
-                              journal, (uint32_t)strlen(journal)),
+    test_resultat(test_ajouter(TEST_JOURNAL, journal, (uint32_t)strlen(journal)),
                   "ajout dans " TEST_JOURNAL);
 
     /* 5. Affichage */

@@ -79,10 +79,19 @@ static ram_fs_node_t *find_node(const char *path) {
     return find_child(parent, name, len);
 }
 
+/* Agrandit le tampon d'un fichier pour contenir needed octets. La capacité
+ * double à chaque fois (au moins 64 octets) : une suite d'ajouts en fin de
+ * fichier ne recopie pas tout le contenu à chaque écriture. */
 static int ensure_capacity(ram_fs_node_t *n, uint32_t needed) {
     if (needed <= n->capacity) return 0;
 
-    uint8_t *new_buf = (uint8_t *)nmap(needed);
+    uint32_t cap = n->capacity ? n->capacity : 64u;
+    while (cap < needed) {
+        if (cap > 0x7FFFFFFFu) { cap = needed; break; }
+        cap *= 2u;
+    }
+
+    uint8_t *new_buf = (uint8_t *)nmap(cap);
     if (!new_buf) return -1;
 
     if (n->data) {
@@ -90,7 +99,7 @@ static int ensure_capacity(ram_fs_node_t *n, uint32_t needed) {
         unmap(n->data);
     }
     n->data = new_buf;
-    n->capacity = needed;
+    n->capacity = cap;
     return 0;
 }
 
@@ -102,113 +111,102 @@ void ram_fs_init(void) {
     spinlock_release(&ram_fs_lock);
 }
 
-ram_fs_file_t *ram_fs_open(const char *path, int flags) {
+int ram_fs_read(const char *path, void *buf, uint32_t len) {
+    if (buf == NULL && len > 0) return -1;
+
     spinlock_acquire(&ram_fs_lock);
 
+    ram_fs_node_t *n = find_node(path);
+    int ret = -1;
+    /* Tout le fichier ou rien : pas de lecture partielle. */
+    if (n != NULL && n->type == RAM_FS_TYPE_FILE && n->size <= len) {
+        if (n->size > 0) memcpy(buf, n->data, n->size);
+        ret = (int)n->size;
+    }
+
+    spinlock_release(&ram_fs_lock);
+    return ret;
+}
+
+/* Fichier path, créé (vide) s'il n'existe pas. NULL si le dossier parent
+ * manque, si le nom est invalide ou si path est un dossier. Verrou tenu
+ * par l'appelant. */
+static ram_fs_node_t *file_get_or_create(const char *path) {
     const char *name;
-    uint32_t len;
-    ram_fs_node_t *parent = resolve_parent(path, &name, &len);
-    if (!parent || len == 0 || len >= RAM_FS_MAX_NAME) {
-        spinlock_release(&ram_fs_lock);
-        return NULL;
-    }
+    uint32_t name_len;
+    ram_fs_node_t *parent = resolve_parent(path, &name, &name_len);
+    if (!parent || name_len == 0 || name_len >= RAM_FS_MAX_NAME) return NULL;
 
-    ram_fs_node_t *node = find_child(parent, name, len);
-    if (!node) {
-        if (!(flags & RAM_FS_O_CREATE)) {
-            spinlock_release(&ram_fs_lock);
-            return NULL;
-        }
-        node = alloc_node(name, len, RAM_FS_TYPE_FILE, parent);
-        if (!node) {
-            spinlock_release(&ram_fs_lock);
-            return NULL;
-        }
-    } else if (node->type == RAM_FS_TYPE_DIR) {
-        spinlock_release(&ram_fs_lock);
-        return NULL;   /* c'est un répertoire, pas un fichier */
-    } else if (node->type == RAM_FS_TYPE_FILE && (flags & RAM_FS_O_TRUNC)) {
-        if (node->data) { unmap(node->data); node->data = NULL; }
-        node->size = 0;
-        node->capacity = 0;
-    }
-
-    spinlock_release(&ram_fs_lock);
-
-    ram_fs_file_t *file = (ram_fs_file_t *)nmap(sizeof(ram_fs_file_t));
-    if (!file) return NULL;
-
-    file->node = node;
-    file->pos = (flags & RAM_FS_O_APPEND) ? node->size : 0;
-    return file;
+    ram_fs_node_t *n = find_child(parent, name, name_len);
+    if (n == NULL) return alloc_node(name, name_len, RAM_FS_TYPE_FILE, parent);
+    return (n->type == RAM_FS_TYPE_FILE) ? n : NULL;
 }
 
-void ram_fs_close(ram_fs_file_t *file) {
-    if (file) unmap(file);
-}
-
-int ram_fs_read(ram_fs_file_t *file, void *buf, uint32_t len) {
-    if (!file) return -1;
-    ram_fs_node_t *n = file->node;
+int ram_fs_write(const char *path, const void *buf, uint32_t len) {
+    if (buf == NULL && len > 0) return -1;
 
     spinlock_acquire(&ram_fs_lock);
 
-    if (file->pos >= n->size) {
-        spinlock_release(&ram_fs_lock);
-        return 0;
+    ram_fs_node_t *n = file_get_or_create(path);
+    int ret = -1;
+    if (n != NULL && ensure_capacity(n, len) == 0) {
+        if (len > 0) memcpy(n->data, buf, len);
+        n->size = len;                       /* l'ancien contenu est remplacé */
+        ret = (int)len;
     }
 
-    uint32_t avail = n->size - file->pos;
-    uint32_t k = (len < avail) ? len : avail;
-    memcpy(buf, n->data + file->pos, k);
-    file->pos += k;
-
     spinlock_release(&ram_fs_lock);
-    return (int)k;
+    return ret;
 }
 
-int ram_fs_write(ram_fs_file_t *file, const void *buf, uint32_t len) {
-    if (!file) return -1;
-    ram_fs_node_t *n = file->node;
-
-    uint32_t end = file->pos + len;
+int ram_fs_append(const char *path, const void *buf, uint32_t len) {
+    if (buf == NULL && len > 0) return -1;
 
     spinlock_acquire(&ram_fs_lock);
 
-    if (ensure_capacity(n, end) != 0) {
-        spinlock_release(&ram_fs_lock);
-        return -1;
+    ram_fs_node_t *n = file_get_or_create(path);
+    int ret = -1;
+    if (n != NULL && len <= 0xFFFFFFFFu - n->size && ensure_capacity(n, n->size + len) == 0) {
+        if (len > 0) memcpy(n->data + n->size, buf, len);
+        n->size += len;
+        ret = (int)len;
     }
-
-    memcpy(n->data + file->pos, buf, len);
-    if (end > n->size) n->size = end;
-    file->pos = end;
 
     spinlock_release(&ram_fs_lock);
-    return (int)len;
+    return ret;
 }
 
-int ram_fs_seek(ram_fs_file_t *file, int32_t offset, int whence) {
-    if (!file) return -1;
-    ram_fs_node_t *n = file->node;
+int ram_fs_truncate(const char *path, uint32_t size) {
+    spinlock_acquire(&ram_fs_lock);
 
-    int32_t base;
-    switch (whence) {
-        case RAM_FS_SEEK_SET: base = 0; break;
-        case RAM_FS_SEEK_CUR: base = (int32_t)file->pos; break;
-        case RAM_FS_SEEK_END: base = (int32_t)n->size; break;
-        default: return -1;
+    ram_fs_node_t *n = find_node(path);
+    int ret = -1;
+    if (n != NULL && n->type == RAM_FS_TYPE_FILE) {
+        if (size <= n->size) {
+            n->size = size;
+            ret = 0;
+        } else if (ensure_capacity(n, size) == 0) {
+            memset(n->data + n->size, 0, size - n->size);
+            n->size = size;
+            ret = 0;
+        }
     }
 
-    int32_t new_pos = base + offset;
-    if (new_pos < 0) return -1;
-
-    file->pos = (uint32_t)new_pos;
-    return (int)file->pos;
+    spinlock_release(&ram_fs_lock);
+    return ret;
 }
 
-uint32_t ram_fs_size(ram_fs_file_t *file) {
-    return file ? file->node->size : 0;
+int ram_fs_stat(const char *path, uint32_t *out_size, int *out_is_dir) {
+    spinlock_acquire(&ram_fs_lock);
+
+    ram_fs_node_t *n = find_node(path);
+    if (n != NULL) {
+        if (out_size) *out_size = (n->type == RAM_FS_TYPE_FILE) ? n->size : 0;
+        if (out_is_dir) *out_is_dir = (n->type == RAM_FS_TYPE_DIR);
+    }
+
+    spinlock_release(&ram_fs_lock);
+    return n != NULL ? 0 : -1;
 }
 
 int ram_fs_unlink(const char *path) {

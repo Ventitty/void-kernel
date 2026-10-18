@@ -38,11 +38,11 @@ typedef struct {
     void *dram_block;
 } elf_image_t;
 
+/* Fichier ELF en cours de chargement : lu en entier en mémoire (vfs_read
+ * ne lit que des fichiers complets), libéré à la fin du chargement. */
 typedef struct {
-    void *handle;
-    int (*read)(void *h, void *buf, uint32_t len);
-    int (*seek)(void *h, int32_t off, int whence);
-    void (*close)(void *h);
+    uint8_t  *data;
+    uint32_t  size;
 } elf_src_t;
 
 int elf_load_image(const char *path, elf_image_t *out);

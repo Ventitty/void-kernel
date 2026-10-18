@@ -22,9 +22,11 @@
  * Les fichiers créés sur PC avec un nom long restent accessibles par leur
  * nom court (ex. "LONGFI~1.TXT") ; les supprimer efface aussi leur nom long.
  *
- * Concurrence : toutes les opérations sont sérialisées par un verrou. Deux
- * fichiers ouverts sur le même fichier ne voient pas les changements de
- * taille de l'autre.
+ * Accès par chemin, sans ouverture ni position : un fichier se lit et
+ * s'écrit en entier (fat32_read, fat32_write) ; fat32_append ajoute à la
+ * fin. Le dernier fichier accédé est gardé en cache.
+ *
+ * Concurrence : toutes les opérations sont sérialisées par un verrou.
  * ------------------------------------------------------------------------- */
 
 #define FAT32_EOC_MIN      0x0FFFFFF8u
@@ -43,17 +45,6 @@
 #define ATTR_ARCHIVE    0x20u
 #define ATTR_LFN        0x0Fu
 
-#define FAT32_SEEK_SET 0
-#define FAT32_SEEK_CUR 1
-#define FAT32_SEEK_END 2
-
-/* Options d'ouverture (mêmes valeurs que VFS_O_*). */
-#define FAT32_O_READ   0x01
-#define FAT32_O_WRITE  0x02
-#define FAT32_O_CREATE 0x04
-#define FAT32_O_TRUNC  0x08
-#define FAT32_O_APPEND 0x10
-
 /* Codes de retour (négatifs) des opérations. */
 #define FAT32_OK              0
 #define FAT32_ERR_IO         -1   /* erreur de lecture/écriture de la carte */
@@ -64,8 +55,8 @@
 #define FAT32_ERR_NOTEMPTY   -6   /* dossier non vide                       */
 #define FAT32_ERR_ISDIR      -7   /* est un dossier                         */
 #define FAT32_ERR_NOTDIR     -8   /* n'est pas un dossier                   */
-#define FAT32_ERR_BADF       -9   /* fichier non ouvert pour cette opération */
 #define FAT32_ERR_NOTMOUNTED -10  /* aucun volume monté                     */
+#define FAT32_ERR_TOOBIG     -11  /* fichier plus grand que le tampon       */
 
 struct volume {
     int mounted;
@@ -89,21 +80,6 @@ struct volume {
     int      fsinfo_dirty;
 };
 
-struct fat32_file {
-    uint32_t first_cluster;
-    uint32_t size;
-    uint32_t pos;
-    int      flags;              /* FAT32_O_*                              */
-
-    uint32_t cached_cluster_index;
-    uint32_t cached_cluster;
-
-    /* Emplacement de l'entrée de dossier, mise à jour à chaque écriture. */
-    uint32_t dirent_lba;
-    uint32_t dirent_off;
-};
-
-typedef struct fat32_file fat32_file_t;
 
 extern void uart_print(const char *str);
 extern void uart_print_hex(uint32_t val);
@@ -115,24 +91,25 @@ void fat32_print_info(void);
 /* Taille et nature d'une entrée. 0, ou FAT32_ERR_*. */
 int fat32_stat(const char *path, uint32_t *out_size, int *out_is_dir);
 
-/* Ouvre un fichier (jamais un dossier). flags : FAT32_O_*. Avec
- * FAT32_O_CREATE, le fichier est créé s'il n'existe pas ; FAT32_O_TRUNC
- * le vide (s'il est ouvert en écriture) ; FAT32_O_APPEND place chaque
- * écriture en fin de fichier. NULL en cas d'échec. */
-fat32_file_t *fat32_open(const char *path, int flags);
-void fat32_close(fat32_file_t *file);
+/* Lit tout le fichier dans buf. Retourne sa taille, ou FAT32_ERR_* :
+ * TOOBIG si len est plus petit que le fichier (pas de lecture partielle),
+ * ISDIR pour un dossier. */
+int fat32_read(const char *path, void *buf, uint32_t len);
 
-/* Octets lus (0 en fin de fichier), ou FAT32_ERR_*. */
-int  fat32_read(fat32_file_t *file, void *buf, uint32_t len);
+/* Remplace tout le contenu du fichier par les len octets de buf : l'ancien
+ * contenu est réécrit puis la fin en trop coupée. Le fichier est créé s'il
+ * n'existe pas (son dossier doit exister) ; len = 0 le vide. Retourne len,
+ * ou FAT32_ERR_* (NOSPC : carte pleine, le fichier ne contient alors que
+ * le début de buf). */
+int fat32_write(const char *path, const void *buf, uint32_t len);
 
-/* Octets écrits, ou FAT32_ERR_*. Écrire après la fin du fichier (après un
- * seek) remplit l'intervalle de zéros. Une écriture partielle (carte
- * pleine en cours de route) retourne le nombre d'octets effectivement
- * écrits. */
-int  fat32_write(fat32_file_t *file, const void *buf, uint32_t len);
+/* Ajoute len octets à la fin du fichier (créé s'il n'existe pas).
+ * Retourne len, ou FAT32_ERR_* (NOSPC : seul le début a été ajouté). */
+int fat32_append(const char *path, const void *buf, uint32_t len);
 
-int  fat32_seek(fat32_file_t *file, int32_t offset, int whence);
-uint32_t fat32_size(fat32_file_t *file);
+/* Fixe la taille d'un fichier : les clusters au-delà sont libérés, ou le
+ * fichier est agrandi avec des zéros. 0, ou FAT32_ERR_*. */
+int fat32_truncate(const char *path, uint32_t size);
 
 /* Supprime un fichier. 0, ou FAT32_ERR_* (ISDIR pour un dossier). */
 int fat32_unlink(const char *path);

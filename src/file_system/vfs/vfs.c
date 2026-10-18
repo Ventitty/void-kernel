@@ -1,8 +1,5 @@
 #include "src/file_system/vfs/vfs.h"
 
-/* vfs_open passe ses options telles quelles à fat32_open. */
-typedef char vfs_fat32_flags_match[(VFS_O_READ == FAT32_O_READ && VFS_O_WRITE == FAT32_O_WRITE && VFS_O_CREATE == FAT32_O_CREATE && VFS_O_TRUNC == FAT32_O_TRUNC && VFS_O_APPEND == FAT32_O_APPEND) ? 1 : -1];
-
 static vfs_dev_t  *dev_list = NULL;
 static spinlock_t  dev_lock = SPINLOCK_INIT;
 
@@ -72,79 +69,58 @@ int vfs_sd_mounted(void) {
     return fat32_is_mounted();
 }
 
-vfs_file_t *vfs_open(const char *path, int flags) {
-    if (!is_valid(path) || is_root(path)) return NULL;
-
-    void *handle;
-    vfs_backend_t backend;
-
-    if (is_ram_path(path)) {
-        vfs_dev_t *dev = dev_lookup(path, 1);
-        if (dev != NULL) {
-            handle = dev;
-            backend = VFS_BACKEND_DEV;
-        } else {
-            if (dev_shadows(path)) return NULL;
-            handle = ram_fs_open(path, flags);
-            backend = VFS_BACKEND_RAM;
-        }
-    } else {
-        /* Les options VFS_O_* ont les mêmes valeurs que FAT32_O_*. */
-        handle = fat32_open(path, flags);
-        backend = VFS_BACKEND_FAT32;
-    }
-    if (handle == NULL) return NULL;
-
-    vfs_file_t *f = (vfs_file_t *)nmap(sizeof(vfs_file_t));
-    if (f == NULL) {
-        if (backend == VFS_BACKEND_RAM)        ram_fs_close((ram_fs_file_t *)handle);
-        else if (backend == VFS_BACKEND_FAT32) fat32_close((fat32_file_t *)handle);
-        return NULL;
-    }
-
-    f->backend = backend;
-    f->handle = handle;
-    return f;
+/* Périphérique de /dev désigné par path, ou NULL. */
+static vfs_dev_t *dev_of(const char *path) {
+    return is_ram_path(path) ? dev_lookup(path, 1) : NULL;
 }
 
-void vfs_close(vfs_file_t *file) {
-    if (file == NULL) return;
-    if (file->backend == VFS_BACKEND_RAM)        ram_fs_close((ram_fs_file_t *)file->handle);
-    else if (file->backend == VFS_BACKEND_FAT32) fat32_close((fat32_file_t *)file->handle);
-    unmap(file);
-}
+int vfs_read(const char *path, void *buf, uint32_t len) {
+    if (!is_valid(path) || is_root(path)) return -1;
+    if (buf == NULL && len > 0) return -1;
 
-int vfs_read(vfs_file_t *file, void *buf, uint32_t len) {
-    if (file == NULL || buf == NULL) return -1;
-    if (file->backend == VFS_BACKEND_DEV) {
-        vfs_dev_t *d = (vfs_dev_t *)file->handle;
-        return d->read ? d->read(buf, len) : -1;
-    }
-    if (file->backend == VFS_BACKEND_RAM) return ram_fs_read((ram_fs_file_t *)file->handle, buf, len);
-    return fat32_read((fat32_file_t *)file->handle, buf, len);
-}
+    vfs_dev_t *dev = dev_of(path);
+    if (dev != NULL) return dev->read ? dev->read(buf, len) : -1;
 
-int vfs_write(vfs_file_t *file, const void *buf, uint32_t len) {
-    if (file == NULL || buf == NULL) return -1;
-    if (file->backend == VFS_BACKEND_DEV) {
-        vfs_dev_t *d = (vfs_dev_t *)file->handle;
-        return d->write ? d->write(buf, len) : -1;
-    }
-    if (file->backend == VFS_BACKEND_RAM) return ram_fs_write((ram_fs_file_t *)file->handle, buf, len);
-    int n = fat32_write((fat32_file_t *)file->handle, buf, len);
+    if (is_ram_path(path)) return dev_shadows(path) ? -1 : ram_fs_read(path, buf, len);
+    int n = fat32_read(path, buf, len);
     return n < 0 ? -1 : n;
 }
 
-int vfs_seek(vfs_file_t *file, int32_t offset, int whence) {
-    if (file == NULL || file->backend == VFS_BACKEND_DEV) return -1;   /* flux : pas de position */
-        if (file->backend == VFS_BACKEND_RAM) return ram_fs_seek((ram_fs_file_t *)file->handle, offset, whence);
-        return fat32_seek((fat32_file_t *)file->handle, offset, whence);
+int vfs_write(const char *path, const void *buf, uint32_t len) {
+    if (!is_valid(path) || is_root(path)) return -1;
+    if (buf == NULL && len > 0) return -1;
+
+    vfs_dev_t *dev = dev_of(path);
+    if (dev != NULL) return dev->write ? dev->write(buf, len) : -1;
+
+    if (is_ram_path(path)) {
+        if (dev_shadows(path) || is_mount_point(path)) return -1;
+        return ram_fs_write(path, buf, len);
+    }
+    int n = fat32_write(path, buf, len);
+    return n < 0 ? -1 : n;
 }
 
-uint32_t vfs_size(vfs_file_t *file) {
-    if (file == NULL || file->backend == VFS_BACKEND_DEV) return 0;
-    if (file->backend == VFS_BACKEND_RAM) return ram_fs_size((ram_fs_file_t *)file->handle);
-    return fat32_size((fat32_file_t *)file->handle);
+int vfs_append(const char *path, const void *buf, uint32_t len) {
+    if (!is_valid(path) || is_root(path)) return -1;
+    if (buf == NULL && len > 0) return -1;
+
+    /* Sur un périphérique, ajouter et écrire reviennent au même. */
+    vfs_dev_t *dev = dev_of(path);
+    if (dev != NULL) return dev->write ? dev->write(buf, len) : -1;
+
+    if (is_ram_path(path)) {
+        if (dev_shadows(path) || is_mount_point(path)) return -1;
+        return ram_fs_append(path, buf, len);
+    }
+    int n = fat32_append(path, buf, len);
+    return n < 0 ? -1 : n;
+}
+
+int vfs_truncate(const char *path, uint32_t size) {
+    if (!is_valid(path) || is_root(path) || is_mount_point(path) || dev_shadows(path)) return -1;
+    if (is_ram_path(path)) return ram_fs_truncate(path, size);
+    return fat32_truncate(path, size) == FAT32_OK ? 0 : -1;
 }
 
 int vfs_stat(const char *path, uint32_t *out_size, int *out_is_dir) {
@@ -165,16 +141,7 @@ int vfs_stat(const char *path, uint32_t *out_size, int *out_is_dir) {
     }
     if (dev_shadows(path)) return -1;
 
-    if (!ram_fs_exists(path)) return -1;
-    int dir = ram_fs_is_dir(path);
-    uint32_t size = 0;
-    if (!dir) {
-        ram_fs_file_t *f = ram_fs_open(path, RAM_FS_O_READ);
-        if (f) { size = ram_fs_size(f); ram_fs_close(f); }
-    }
-    if (out_size) *out_size = size;
-    if (out_is_dir) *out_is_dir = dir;
-    return 0;
+    return ram_fs_stat(path, out_size, out_is_dir);
 }
 
 int vfs_exists(const char *path) {

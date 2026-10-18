@@ -17,6 +17,8 @@ static uint8_t  sec_buf[512];
 static uint8_t  fat_buf[512];
 static uint32_t fat_buf_lba = 0xFFFFFFFFu;
 
+static void cache_invalidate(void);   /* cache du dernier fichier, plus bas */
+
 /* Date écrite dans les entrées créées ou modifiées : le noyau n'a pas
  * d'horloge calendaire. 1er janvier 2026, minuit. */
 #define FAT_DATE(y, m, d) ((uint16_t)((((y) - 1980u) << 9) | ((m) << 5) | (d)))
@@ -81,6 +83,7 @@ int fat32_mount(void) {
     int ret = FAT32_ERR_IO;
 
     spinlock_acquire(&fat32_lock);
+    cache_invalidate();
     vol.mounted = 0;
     fat_buf_lba = 0xFFFFFFFFu;
 
@@ -598,74 +601,90 @@ int fat32_stat(const char *path, uint32_t *out_size, int *out_is_dir) {
 
 /* ---- Fichiers ------------------------------------------------------------ */
 
-fat32_file_t *fat32_open(const char *path, int flags) {
-    if (!vol.mounted) return NULL;
+/* Fichier en cours de manipulation : entrée de dossier et position dans
+ * la chaîne de clusters. Interne : l'interface publique travaille par
+ * chemin, sans ouverture. */
+typedef struct {
+    uint32_t first_cluster;
+    uint32_t size;
+    uint32_t cached_cluster_index;   /* dernier cluster atteint dans la chaîne */
+    uint32_t cached_cluster;
+    uint32_t dirent_lba;             /* emplacement de l'entrée de dossier     */
+    uint32_t dirent_off;
+} fat32_node_t;
 
-    fat32_file_t *f = NULL;
-    spinlock_acquire(&fat32_lock);
+/* Cache du dernier fichier accédé : un vfs_stat suivi d'un read (chargeur
+ * ELF), ou des ajouts successifs dans un journal, ne refont pas la
+ * recherche dans les dossiers. Le cache garde l'entrée et le dernier
+ * cluster atteint, ce qui évite aussi de reparcourir la chaîne depuis le
+ * début pour chaque ajout. Il est mis à jour par les
+ * écritures qui passent par lui, et invalidé par toute suppression ou
+ * création de dossier. Un même fichier écrit sous une autre graphie du
+ * chemin ("/a.txt" / "/A.TXT") remplace simplement l'entrée du cache. */
+#define FAT32_CACHE_PATH_MAX 128u
 
+static struct {
+    int          valid;
+    char         path[FAT32_CACHE_PATH_MAX];
+    fat32_node_t node;
+} cache;
+
+static void cache_invalidate(void) {
+    cache.valid = 0;
+}
+
+/* Fichier désigné par path, dans cache.node. Avec create, un fichier
+ * absent est créé (vide). 0, ou FAT32_ERR_* (ISDIR pour un dossier). */
+static int node_get(const char *path, int create, fat32_node_t **out) {
+    if (cache.valid && strcmp(cache.path, path) == 0) {
+        *out = &cache.node;
+        return FAT32_OK;
+    }
+    cache.valid = 0;
+
+    fat32_node_t *n = &cache.node;
     uint32_t parent;
     dentry_t d;
     int r = lookup_path(path, &d, &parent);
-    if (r == 2) goto out;                              /* la racine */
+    if (r == 2) return FAT32_ERR_ISDIR;   /* la racine */
 
-        uint32_t first = 0, size = 0;
-    dloc_t loc;
-
-    if (r == 1) {
-        if (dirent_is_dir(d.raw)) goto out;
-        first = dirent_cluster(d.raw);
-        size  = rd32(&d.raw[28]);
-        loc   = d.loc;
-
-        if ((flags & FAT32_O_TRUNC) && (flags & FAT32_O_WRITE) && (size != 0 || first != 0)) {
-            if (valid_cluster(first) && free_chain(first) != 0) goto out;
-            dirent_set_cluster(d.raw, 0);
-            wr32(&d.raw[28], 0);
-            wr16(&d.raw[22], FAT32_DEFAULT_TIME);
-            wr16(&d.raw[24], FAT32_DEFAULT_DATE);
-            if (write_dirent(&d.loc, d.raw) != 0) goto out;
-            first = 0;
-            size = 0;
+        if (r == 1) {
+            if (dirent_is_dir(d.raw)) return FAT32_ERR_ISDIR;
+            n->first_cluster = dirent_cluster(d.raw);
+            n->size          = rd32(&d.raw[28]);
+            n->dirent_lba    = d.loc.lba;
+            n->dirent_off    = d.loc.off;
+        } else if (r == FAT32_ERR_NOENT && create) {
+            const char *name;
+            uint32_t len;
+            dloc_t loc;
+            r = resolve_parent(path, &parent, &name, &len);
+            if (r != FAT32_OK) return r;
+            if (len == 0) return FAT32_ERR_ISDIR;
+            r = create_entry(parent, name, len, ATTR_ARCHIVE, 0, &loc);
+            if (r != FAT32_OK) return r;
+            n->first_cluster = 0;
+            n->size          = 0;
+            n->dirent_lba    = loc.lba;
+            n->dirent_off    = loc.off;
+        } else {
+            return r;
         }
-    } else if (r == FAT32_ERR_NOENT && (flags & FAT32_O_CREATE)) {
-        const char *name;
-        uint32_t len;
-        if (resolve_parent(path, &parent, &name, &len) != FAT32_OK) goto out;
-        if (create_entry(parent, name, len, ATTR_ARCHIVE, 0, &loc) != FAT32_OK) goto out;
-    } else {
-        goto out;
-    }
 
-    f = (fat32_file_t *)nmap(sizeof(fat32_file_t));
-    if (f == NULL) goto out;
+        n->cached_cluster_index = 0;
+        n->cached_cluster       = n->first_cluster;
 
-    f->first_cluster        = first;
-    f->size                 = size;
-    f->pos                  = (flags & FAT32_O_APPEND) ? size : 0;
-    f->flags                = flags;
-    f->cached_cluster_index = 0;
-    f->cached_cluster       = first;
-    f->dirent_lba           = loc.lba;
-    f->dirent_off           = loc.off;
-
-    out:
-    fsinfo_flush();
-    spinlock_release(&fat32_lock);
-    return f;
-}
-
-void fat32_close(fat32_file_t *file) {
-    if (file) unmap(file);
-}
-
-uint32_t fat32_size(fat32_file_t *file) {
-    return file ? file->size : 0;
+        if (strlen(path) < FAT32_CACHE_PATH_MAX) {
+            strcpy(cache.path, path);
+            cache.valid = 1;
+        }
+        *out = n;
+        return FAT32_OK;
 }
 
 /* Cluster d'indice index dans la chaîne du fichier (lecture). 0 si la
  * chaîne est plus courte. */
-static uint32_t cluster_for_read(fat32_file_t *file, uint32_t index) {
+static uint32_t cluster_for_read(fat32_node_t *file, uint32_t index) {
     uint32_t c, i;
     if (file->cached_cluster_index <= index && valid_cluster(file->cached_cluster)) {
         c = file->cached_cluster;
@@ -690,7 +709,7 @@ static uint32_t cluster_for_read(fat32_file_t *file, uint32_t index) {
 /* Cluster d'indice index pour une écriture : la chaîne est prolongée (et
  * créée si le fichier est vide) autant que nécessaire. 0 si la carte est
  * pleine ou en cas d'erreur. */
-static uint32_t cluster_for_write(fat32_file_t *file, uint32_t index) {
+static uint32_t cluster_for_write(fat32_node_t *file, uint32_t index) {
     if (!valid_cluster(file->first_cluster)) {
         uint32_t c = alloc_cluster(0);
         if (c == 0) return 0;
@@ -722,45 +741,9 @@ static uint32_t cluster_for_write(fat32_file_t *file, uint32_t index) {
     return c;
 }
 
-int fat32_read(fat32_file_t *file, void *buf, uint32_t len) {
-    if (!file || !vol.mounted) return FAT32_ERR_BADF;
-    if (!(file->flags & FAT32_O_READ)) return FAT32_ERR_BADF;
-    if (file->pos >= file->size) return 0;
-
-    uint32_t avail = file->size - file->pos;
-    if (len > avail) len = avail;
-
-    uint32_t bpc = bytes_per_cluster();
-    uint8_t *out = (uint8_t *)buf;
-    uint32_t done = 0;
-
-    spinlock_acquire(&fat32_lock);
-
-    while (done < len) {
-        uint32_t abs_pos = file->pos + done;
-        uint32_t cluster = cluster_for_read(file, abs_pos / bpc);
-        if (cluster == 0) break;
-
-        uint32_t in_cluster = abs_pos % bpc;
-        uint32_t lba = cluster_to_lba(cluster) + in_cluster / 512u;
-        uint32_t in_sector = in_cluster % 512u;
-
-        if (sd_read_block(lba, sec_buf) != 0) break;
-
-        uint32_t chunk = 512u - in_sector;
-        if (chunk > len - done) chunk = len - done;
-        memcpy(out + done, sec_buf + in_sector, chunk);
-        done += chunk;
-    }
-
-    file->pos += done;
-    spinlock_release(&fat32_lock);
-    return (int)done;
-}
-
 /* Écrit len octets à partir de offset (src NULL : des zéros). Retourne le
  * nombre d'octets écrits. */
-static uint32_t write_at(fat32_file_t *file, uint32_t offset, const uint8_t *src, uint32_t len) {
+static uint32_t write_at(fat32_node_t *file, uint32_t offset, const uint8_t *src, uint32_t len) {
     uint32_t bpc = bytes_per_cluster();
     uint32_t done = 0;
 
@@ -789,7 +772,7 @@ static uint32_t write_at(fat32_file_t *file, uint32_t offset, const uint8_t *src
 }
 
 /* Reporte taille et premier cluster dans l'entrée de dossier du fichier. */
-static int update_file_dirent(const fat32_file_t *file) {
+static int update_file_dirent(const fat32_node_t *file) {
     if (sd_read_block(file->dirent_lba, sec_buf) != 0) return -1;
     uint8_t *e = &sec_buf[file->dirent_off];
     dirent_set_cluster(e, valid_cluster(file->first_cluster) ? file->first_cluster : 0);
@@ -800,64 +783,177 @@ static int update_file_dirent(const fat32_file_t *file) {
     return sd_write_block(file->dirent_lba, sec_buf) == 0 ? 0 : -1;
 }
 
-int fat32_write(fat32_file_t *file, const void *buf, uint32_t len) {
-    if (!file || !vol.mounted) return FAT32_ERR_BADF;
-    if (!(file->flags & FAT32_O_WRITE)) return FAT32_ERR_BADF;
-    if (len == 0) return 0;
-    if (buf == NULL) return FAT32_ERR_INVAL;
+/* Copie len octets à partir de offset (dans les limites du fichier).
+ * Retourne le nombre d'octets copiés. Verrou tenu par l'appelant. */
+static uint32_t read_at(fat32_node_t *file, uint32_t offset, uint8_t *out, uint32_t len) {
+    uint32_t bpc = bytes_per_cluster();
+    uint32_t done = 0;
+
+    while (done < len) {
+        uint32_t abs_pos = offset + done;
+        uint32_t cluster = cluster_for_read(file, abs_pos / bpc);
+        if (cluster == 0) break;
+
+        uint32_t in_cluster = abs_pos % bpc;
+        uint32_t lba = cluster_to_lba(cluster) + in_cluster / 512u;
+        uint32_t in_sector = in_cluster % 512u;
+
+        uint32_t chunk = 512u - in_sector;
+        if (chunk > len - done) chunk = len - done;
+
+        /* Secteur complet : lu directement dans le tampon de l'appelant,
+         * sans passer par sec_buf. */
+        if (chunk == 512u) {
+            if (sd_read_block(lba, out + done) != 0) break;
+        } else {
+            if (sd_read_block(lba, sec_buf) != 0) break;
+            memcpy(out + done, sec_buf + in_sector, chunk);
+        }
+        done += chunk;
+    }
+    return done;
+}
+
+/* Fixe la taille du fichier : les clusters au-delà sont libérés, ou le
+ * fichier est agrandi avec des zéros. Met à jour l'entrée de dossier.
+ * 0, ou FAT32_ERR_*. Verrou tenu par l'appelant. */
+static int resize(fat32_node_t *file, uint32_t size) {
+    int r = FAT32_OK;
+    if (size == file->size) return FAT32_OK;
+
+    if (size > file->size) {
+        uint32_t add = size - file->size;
+        uint32_t z = write_at(file, file->size, NULL, add);
+        file->size += z;
+        if (z != add) r = FAT32_ERR_NOSPC;
+    } else {
+        /* Garder les clusters nécessaires, libérer la suite. */
+        uint32_t bpc = bytes_per_cluster();
+        uint32_t keep = size / bpc + (size % bpc != 0 ? 1u : 0u);
+
+        if (keep == 0) {
+            if (valid_cluster(file->first_cluster) && free_chain(file->first_cluster) != 0) r = FAT32_ERR_IO;
+            file->first_cluster = 0;
+        } else {
+            uint32_t last = cluster_for_read(file, keep - 1u);
+            if (last == 0) {
+                r = FAT32_ERR_IO;
+            } else {
+                uint32_t next = fat_get(last);
+                if (valid_cluster(next) && next < FAT32_EOC_MIN) {
+                    if (fat_set(last, FAT32_EOC) != 0 || free_chain(next) != 0) r = FAT32_ERR_IO;
+                }
+            }
+        }
+        file->size = size;
+        file->cached_cluster_index = 0;
+        file->cached_cluster = file->first_cluster;
+    }
+
+    if (update_file_dirent(file) != 0) r = FAT32_ERR_IO;
+    return r;
+}
+
+int fat32_read(const char *path, void *buf, uint32_t len) {
+    if (!vol.mounted) return FAT32_ERR_NOTMOUNTED;
+    if (buf == NULL && len > 0) return FAT32_ERR_INVAL;
 
     spinlock_acquire(&fat32_lock);
 
-    if (file->flags & FAT32_O_APPEND) file->pos = file->size;
-
-    /* Taille maximale d'un fichier FAT32 : 4 Go - 1. */
-    if (file->pos > 0xFFFFFFFFu - len) len = 0xFFFFFFFFu - file->pos;
-
-    int ret;
-    uint32_t old_first = file->first_cluster;
-    uint32_t old_size  = file->size;
-
-    /* Écriture au-delà de la fin : combler l'intervalle de zéros. */
-    if (file->pos > file->size) {
-        uint32_t gap = file->pos - file->size;
-        uint32_t z = write_at(file, file->size, NULL, gap);
-        file->size += z;
-        if (z != gap) {
-            ret = FAT32_ERR_NOSPC;
-            goto update;
+    fat32_node_t *file;
+    int r = node_get(path, 0, &file);
+    if (r == FAT32_OK) {
+        if (file->size > len) {
+            r = FAT32_ERR_TOOBIG;            /* pas de lecture partielle */
+        } else {
+            uint32_t n = read_at(file, 0, (uint8_t *)buf, file->size);
+            r = (n == file->size) ? (int)n : FAT32_ERR_IO;
         }
     }
 
-    uint32_t n = write_at(file, file->pos, (const uint8_t *)buf, len);
-    file->pos += n;
-    if (file->pos > file->size) file->size = file->pos;
-    ret = (n > 0) ? (int)n : FAT32_ERR_NOSPC;
+    spinlock_release(&fat32_lock);
+    return r;
+}
 
-    update:
-    if (file->size != old_size || file->first_cluster != old_first) {
-        if (update_file_dirent(file) != 0) ret = FAT32_ERR_IO;
+int fat32_write(const char *path, const void *buf, uint32_t len) {
+    if (!vol.mounted) return FAT32_ERR_NOTMOUNTED;
+    if (buf == NULL && len > 0) return FAT32_ERR_INVAL;
+
+    spinlock_acquire(&fat32_lock);
+
+    fat32_node_t *file;
+    int ret = node_get(path, 1, &file);
+    if (ret != FAT32_OK) goto out;
+
+    /* Réécrire par-dessus l'ancien contenu réutilise ses clusters ; la
+     * troncature libère ensuite ceux qui dépassent. Si la carte est pleine
+     * en cours de route, le fichier est coupé après le dernier octet écrit. */
+    uint32_t old_first = file->first_cluster;
+    uint32_t n = write_at(file, 0, (const uint8_t *)buf, len);
+    if (n < file->size) {
+        ret = resize(file, n);                      /* coupe et met à jour l'entrée */
+    } else {
+        ret = FAT32_OK;
+        if (n != file->size || file->first_cluster != old_first) {
+            file->size = n;
+            if (update_file_dirent(file) != 0) ret = FAT32_ERR_IO;
+        }
     }
+    if (ret == FAT32_OK && n != len) ret = FAT32_ERR_NOSPC;
+    if (ret == FAT32_OK) ret = (int)n;
+    else cache_invalidate();
+
+    out:
     fsinfo_flush();
     spinlock_release(&fat32_lock);
     return ret;
 }
 
-int fat32_seek(fat32_file_t *file, int32_t offset, int whence) {
-    if (!file) return FAT32_ERR_BADF;
+int fat32_append(const char *path, const void *buf, uint32_t len) {
+    if (!vol.mounted) return FAT32_ERR_NOTMOUNTED;
+    if (buf == NULL && len > 0) return FAT32_ERR_INVAL;
 
-    int32_t base;
-    switch (whence) {
-        case FAT32_SEEK_SET: base = 0; break;
-        case FAT32_SEEK_CUR: base = (int32_t)file->pos; break;
-        case FAT32_SEEK_END: base = (int32_t)file->size; break;
-        default: return FAT32_ERR_INVAL;
+    spinlock_acquire(&fat32_lock);
+
+    fat32_node_t *file;
+    int ret = node_get(path, 1, &file);
+    if (ret != FAT32_OK) goto out;
+
+    /* Taille maximale d'un fichier FAT32 : 4 Go - 1. */
+    if (len > 0xFFFFFFFFu - file->size) { ret = FAT32_ERR_NOSPC; goto out; }
+
+    uint32_t n = write_at(file, file->size, (const uint8_t *)buf, len);
+    if (n > 0) {
+        file->size += n;
+        if (update_file_dirent(file) != 0) {
+            cache_invalidate();
+            ret = FAT32_ERR_IO;
+            goto out;
+        }
+    }
+    ret = (n == len) ? (int)n : FAT32_ERR_NOSPC;
+
+    out:
+    fsinfo_flush();
+    spinlock_release(&fat32_lock);
+    return ret;
+}
+
+int fat32_truncate(const char *path, uint32_t size) {
+    if (!vol.mounted) return FAT32_ERR_NOTMOUNTED;
+
+    spinlock_acquire(&fat32_lock);
+
+    fat32_node_t *file;
+    int r = node_get(path, 0, &file);
+    if (r == FAT32_OK) {
+        r = resize(file, size);
+        if (r != FAT32_OK) cache_invalidate();
     }
 
-    int32_t new_pos = base + offset;
-    if (new_pos < 0) return FAT32_ERR_INVAL;
-
-    file->pos = (uint32_t)new_pos;
-    return (int)file->pos;
+    fsinfo_flush();
+    spinlock_release(&fat32_lock);
+    return r;
 }
 
 /* ---- Suppression et dossiers -------------------------------------------- */
@@ -866,6 +962,7 @@ int fat32_unlink(const char *path) {
     if (!vol.mounted) return FAT32_ERR_NOTMOUNTED;
 
     spinlock_acquire(&fat32_lock);
+    cache_invalidate();
     dentry_t d;
     int r = lookup_path(path, &d, NULL);
     if (r == 2) r = FAT32_ERR_ISDIR;
@@ -890,6 +987,7 @@ int fat32_mkdir(const char *path) {
     if (!vol.mounted) return FAT32_ERR_NOTMOUNTED;
 
     spinlock_acquire(&fat32_lock);
+    cache_invalidate();
 
     uint32_t parent;
     const char *name;
@@ -956,6 +1054,7 @@ int fat32_rmdir(const char *path) {
     if (!vol.mounted) return FAT32_ERR_NOTMOUNTED;
 
     spinlock_acquire(&fat32_lock);
+    cache_invalidate();
     dentry_t d;
     int r = lookup_path(path, &d, NULL);
     if (r == 2) r = FAT32_ERR_INVAL;   /* la racine */

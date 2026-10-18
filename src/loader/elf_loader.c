@@ -3,20 +3,37 @@
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)); }
 
-static int  src_vfs_read(void *h, void *b, uint32_t n) { return vfs_read((vfs_file_t *)h, b, n); }
-static int  src_vfs_seek(void *h, int32_t o, int w)    { return vfs_seek((vfs_file_t *)h, o, w); }
-static void src_vfs_close(void *h)                     { vfs_close((vfs_file_t *)h); }
-
+/* Charge tout le fichier path en mémoire. 0, ou -1. */
 static int elf_src_open(const char *path, elf_src_t *out) {
-    vfs_file_t *f = vfs_open(path, VFS_O_READ);
-    if (!f) return -1;
-    out->handle = f; out->read = src_vfs_read; out->seek = src_vfs_seek; out->close = src_vfs_close;
+    uint32_t size = 0;
+    int dir = 1;
+    out->data = NULL;
+    out->size = 0;
+    if (vfs_stat(path, &size, &dir) != 0 || dir || size < EHDR_SIZE) return -1;
+
+    out->data = (uint8_t *)nmap(size);
+    if (out->data == NULL) return -1;
+    if (vfs_read(path, out->data, size) != (int)size) {
+        unmap(out->data);
+        out->data = NULL;
+        return -1;
+    }
+    out->size = size;
     return 0;
 }
 
+static void elf_src_close(elf_src_t *s) {
+    if (s->data != NULL) unmap(s->data);
+    s->data = NULL;
+    s->size = 0;
+}
+
+/* Copie exactement len octets depuis la position off. 0, ou -1 si la zone
+ * déborde du fichier (ELF corrompu). */
 static int src_read_at(elf_src_t *s, uint32_t off, void *buf, uint32_t len) {
-    if (s->seek(s->handle, (int32_t)off, 0) < 0) return -1;
-    return (s->read(s->handle, buf, len) == (int)len) ? 0 : -1;
+    if (off > s->size || len > s->size - off) return -1;
+    memcpy(buf, s->data + off, len);
+    return 0;
 }
 
 static mem_pool_t code_pool;
@@ -56,15 +73,13 @@ static int load_section(elf_src_t *src, const sec_t *s, uint32_t dst) {
         for (uint32_t o = 0; o < s->size; o += 4) write32(dst + o, 0);
         return 0;
     }
-    if (src->seek(src->handle, (int32_t)s->offset, 0) < 0) return -1;
-
     uint32_t done = 0;
     while (done < s->size) {
         uint8_t buf[256];
         uint32_t chunk = s->size - done;
         if (chunk > sizeof(buf)) chunk = sizeof(buf);
         memset(buf, 0, sizeof(buf));
-        if (src->read(src->handle, buf, chunk) != (int)chunk) return -1;
+        if (src_read_at(src, s->offset + done, buf, chunk) != 0) return -1;
 
         uint32_t words = (chunk + 3u) / 4u;
         const uint32_t *b32 = (const uint32_t *)buf;
@@ -85,7 +100,7 @@ static const sec_t *section_of_addr(const sec_t *secs, uint32_t n, uint32_t addr
 int elf_load_image(const char *path, elf_image_t *out) {
     elf_src_t src;
     if (out == NULL || elf_src_open(path, &src) != 0) {
-        uart_print("[elf] fichier introuvable : "); uart_print(path); uart_print("\n");
+        uart_print("[elf] fichier introuvable ou trop gros : "); uart_print(path); uart_print("\n");
         return -1;
     }
 
@@ -238,7 +253,7 @@ int elf_load_image(const char *path, elf_image_t *out) {
         if (iram_block != NULL) pool_free(&code_pool, iram_block);
         if (dram_block != NULL) unmap(dram_block);
         if (secs != NULL) unmap(secs);
-        src.close(src.handle);
+        elf_src_close(&src);
     return ret;
 }
 
