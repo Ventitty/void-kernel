@@ -79,23 +79,42 @@ static ram_fs_node_t *find_node(const char *path) {
     return find_child(parent, name, len);
 }
 
-/* Agrandit le tampon d'un fichier pour contenir needed octets. La capacité
- * double à chaque fois (au moins 64 octets) : une suite d'ajouts en fin de
- * fichier ne recopie pas tout le contenu à chaque écriture. */
-static int ensure_capacity(ram_fs_node_t *n, uint32_t needed) {
-    if (needed <= n->capacity) return 0;
+/* Octets réellement utilisables dans un bloc nmap(size) : l'allocateur
+ * arrondit chaque bloc, en-tête compris, au multiple de 128 supérieur.
+ * La place en trop est de toute façon perdue : autant la compter dans la
+ * capacité du fichier, de petits ajouts y tiennent sans réallocation.
+ * 0 si size est trop grand pour être alloué. */
+static uint32_t block_capacity(uint32_t size) {
+    if (size > 0xFFFFFFFFu - HEADER_SIZE - 127u) return 0;
+    return (uint32_t)(ALIGN_UP((size_t)size + HEADER_SIZE, 128) - HEADER_SIZE);
+}
 
-    uint32_t cap = n->capacity ? n->capacity : 64u;
-    while (cap < needed) {
-        if (cap > 0x7FFFFFFFu) { cap = needed; break; }
-        cap *= 2u;
+/* Ajuste le tampon d'un fichier au plus petit bloc pouvant contenir size
+ * octets : il grandit ou rétrécit, et disparaît pour size = 0. Avec keep,
+ * le début du contenu (jusqu'à size octets) est conservé ; sinon le tampon
+ * est laissé tel quel pour être entièrement réécrit par l'appelant (pas de
+ * recopie inutile). Ne touche pas à n->size. 0, ou -1 si la mémoire manque
+ * pour grandir (le fichier est alors inchangé). */
+static int set_buffer(ram_fs_node_t *n, uint32_t size, int keep) {
+    if (size == 0) {
+        if (n->data) unmap(n->data);
+        n->data = NULL;
+        n->capacity = 0;
+        return 0;
     }
 
-    uint8_t *new_buf = (uint8_t *)nmap(cap);
-    if (!new_buf) return -1;
+    uint32_t cap = block_capacity(size);
+    if (cap == 0) return -1;
+    if (cap == n->capacity) return 0;         /* déjà le bon bloc */
+
+        uint8_t *new_buf = (uint8_t *)nmap(size);
+    if (new_buf == NULL) {
+        /* Pour rétrécir, garder l'ancien bloc plus grand reste correct. */
+        return (size <= n->capacity) ? 0 : -1;
+    }
 
     if (n->data) {
-        memcpy(new_buf, n->data, n->size);
+        if (keep) memcpy(new_buf, n->data, (n->size < size) ? n->size : size);
         unmap(n->data);
     }
     n->data = new_buf;
@@ -149,7 +168,8 @@ int ram_fs_write(const char *path, const void *buf, uint32_t len) {
 
     ram_fs_node_t *n = file_get_or_create(path);
     int ret = -1;
-    if (n != NULL && ensure_capacity(n, len) == 0) {
+    /* Nouveau bloc à la taille exacte, sans recopier l'ancien contenu. */
+    if (n != NULL && set_buffer(n, len, 0) == 0) {
         if (len > 0) memcpy(n->data, buf, len);
         n->size = len;                       /* l'ancien contenu est remplacé */
         ret = (int)len;
@@ -166,13 +186,14 @@ int ram_fs_append(const char *path, const void *buf, uint32_t len) {
 
     ram_fs_node_t *n = file_get_or_create(path);
     int ret = -1;
-    if (n != NULL && len <= 0xFFFFFFFFu - n->size && ensure_capacity(n, n->size + len) == 0) {
+    if (n != NULL && len <= 0xFFFFFFFFu - n->size &&
+        (n->size + len <= n->capacity || set_buffer(n, n->size + len, 1) == 0)) {
         if (len > 0) memcpy(n->data + n->size, buf, len);
         n->size += len;
         ret = (int)len;
-    }
+        }
 
-    spinlock_release(&ram_fs_lock);
+        spinlock_release(&ram_fs_lock);
     return ret;
 }
 
@@ -182,11 +203,8 @@ int ram_fs_truncate(const char *path, uint32_t size) {
     ram_fs_node_t *n = find_node(path);
     int ret = -1;
     if (n != NULL && n->type == RAM_FS_TYPE_FILE) {
-        if (size <= n->size) {
-            n->size = size;
-            ret = 0;
-        } else if (ensure_capacity(n, size) == 0) {
-            memset(n->data + n->size, 0, size - n->size);
+        if (set_buffer(n, size, 1) == 0) {
+            if (size > n->size) memset(n->data + n->size, 0, size - n->size);
             n->size = size;
             ret = 0;
         }

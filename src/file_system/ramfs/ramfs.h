@@ -43,6 +43,13 @@ void ram_fs_init(void);
  * ram_fs_append : ajoute len octets à la fin (fichier créé s'il n'existe
  *   pas). Retourne len, ou -1.
  * ram_fs_truncate : fixe la taille du fichier (agrandi avec des zéros).
+ *
+ * Mémoire : le tampon d'un fichier est toujours le plus petit bloc de
+ * l'allocateur pouvant le contenir (multiple de 128 octets, en-tête
+ * compris). Il est réalloué à la bonne taille quand le fichier grandit ou
+ * rétrécit, et libéré quand le fichier devient vide. Un ajout qui ne tient
+ * plus dans le bloc recopie tout le fichier : pour de nombreux petits
+ * ajouts sur un gros fichier, mieux vaut regrouper les données.
  * ram_fs_stat : taille et nature d'une entrée ; 0, ou -1 si absente. */
 int ram_fs_read(const char *path, void *buf, uint32_t len);
 int ram_fs_write(const char *path, const void *buf, uint32_t len);
