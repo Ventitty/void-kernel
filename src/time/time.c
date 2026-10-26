@@ -6,6 +6,14 @@ static uint32_t cycles_per_us = CLOCK_DEFAULT_HZ / 1000000u;
 static volatile uint32_t ticks_lo = 0;
 static volatile uint32_t ticks_hi = 0;
 static spinlock_t ticks_lock = SPINLOCK_INIT;
+static spinlock_t clock_change_lock = SPINLOCK_INIT;
+
+static void set_cpu_hz(uint32_t hz) {
+    cpu_hz = hz;
+    tick_cycles = hz / TICK_HZ;
+    cycles_per_us = hz / 1000000u;
+    if (cycles_per_us == 0) cycles_per_us = 1;
+}
 
 static void print_dec(uint32_t v) {
     char buf[12];
@@ -22,10 +30,7 @@ void time_init(void) {
         uart_print(" ");
     }
 
-    cpu_hz = hz;
-    tick_cycles = hz / TICK_HZ;
-    cycles_per_us = hz / 1000000u;
-    if (cycles_per_us == 0) cycles_per_us = 1;
+    set_cpu_hz(hz);
 
     print_dec(hz / 1000000u);
     uart_print(" MHz, tick a ");
@@ -78,6 +83,31 @@ uint64_t time_uptime_ms(void) {
 
 uint32_t time_cpu_hz(void) {
     return cpu_hz;
+}
+
+int time_set_cpu_mhz(uint32_t mhz) {
+    if (!clock_cpu_mhz_supported(mhz)) return -1;
+    if (clock_get_cpu_mhz() == mhz && cpu_hz == mhz * 1000000u) return 0;
+
+    spinlock_acquire(&clock_change_lock);
+
+    uint32_t other = cpu_core_id() == 0 ? 1u : 0u;
+    clock_stall_core(other);
+
+    (void)uart0_wait_tx_idle((cpu_hz / 1000u) * 50u);
+
+    uint32_t apb_hz = 0;
+    int r = clock_set_cpu_mhz(mhz, &apb_hz);
+    uint32_t now_mhz = clock_get_cpu_mhz();
+
+    (void)uart0_set_baud(CLOCK_UART_BAUD, apb_hz);
+    set_cpu_hz(now_mhz * 1000000u);
+
+    cpu_write_ccompare0(cpu_read_ccount() + tick_cycles);
+
+    clock_unstall_core(other);
+    spinlock_release(&clock_change_lock);
+    return r;
 }
 
 uint32_t time_ms_to_ticks(uint32_t ms) {

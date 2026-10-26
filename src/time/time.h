@@ -9,9 +9,10 @@
 #include "arch/xtensa_lx6/includes/cpu.h"
 #include "arch/xtensa_lx6/includes/xtensa.h"
 #include "arch/xtensa_lx6/drivers/esp32_clock/clock.h"
+#include "arch/xtensa_lx6/drivers/esp32_uart/uart.h"
 
 #ifndef TICK_HZ
-    #define TICK_HZ 1000u
+#define TICK_HZ 1000u
 #endif
 
 #define TICK_MS (1000u / TICK_HZ)
@@ -27,6 +28,8 @@ uint32_t tick_count(void);
 uint64_t tick_count64(void);
 uint64_t time_uptime_ms(void);
 uint32_t time_cpu_hz(void);
+
+int time_set_cpu_mhz(uint32_t mhz);
 uint32_t time_ms_to_ticks(uint32_t ms);
 int sleep_ms(uint32_t ms);
 int sleep_ticks(uint32_t n);
