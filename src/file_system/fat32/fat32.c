@@ -1099,8 +1099,13 @@ static void format_name(const uint8_t *e, char out[13]) {
     out[n] = '\0';
 }
 
-int fat32_ls(const char *path) {
+int fat32_ls(const char *path, char ***out) {
+    *out = NULL;
     if (!vol.mounted) return FAT32_ERR_NOTMOUNTED;
+    if (path == NULL) return FAT32_ERR_INVAL;
+
+    path_list_t pl;
+    path_list_init(&pl);
 
     spinlock_acquire(&fat32_lock);
 
@@ -1108,36 +1113,29 @@ int fat32_ls(const char *path) {
     dentry_t d;
     int r = lookup_path(path, &d, NULL);
     if (r == 1) {
-        if (!dirent_is_dir(d.raw)) { spinlock_release(&fat32_lock); return FAT32_ERR_NOTDIR; }
+        if (!dirent_is_dir(d.raw)) { r = FAT32_ERR_NOTDIR; goto fail; }
         uint32_t c = dirent_cluster(d.raw);
         dir_cluster = valid_cluster(c) ? c : vol.root_cluster;
     } else if (r != 2) {
-        spinlock_release(&fat32_lock);
-        return r;
+        goto fail;
     }
 
     uint32_t c = dir_cluster;
     for (uint32_t n = 0; n < vol.total_clusters && valid_cluster(c); n++) {
         uint32_t base = cluster_to_lba(c);
         for (uint32_t s = 0; s < vol.sectors_per_cluster; s++) {
-            if (sd_read_block(base + s, sec_buf) != 0) { spinlock_release(&fat32_lock); return FAT32_ERR_IO; }
+            if (sd_read_block(base + s, sec_buf) != 0) { r = FAT32_ERR_IO; goto fail; }
 
             for (uint32_t off = 0; off < 512; off += DIRENT_SIZE) {
                 const uint8_t *e = &sec_buf[off];
-                if (e[0] == DIRENT_FREE) { spinlock_release(&fat32_lock); return FAT32_OK; }
-                if (e[0] == DIRENT_DELETED) continue;
-                if (e[11] == ATTR_LFN || (e[11] & ATTR_VOLUME_ID)) continue;
+                if (e[0] == DIRENT_FREE) goto done;        /* fin du dossier */
+                    if (e[0] == DIRENT_DELETED) continue;
+                    if (e[11] == ATTR_LFN || (e[11] & ATTR_VOLUME_ID)) continue;
+                    if (e[0] == '.') continue;                  /* "." et ".." */
 
-                char name[13];
+                        char name[13];
                 format_name(e, name);
-                uart_print(dirent_is_dir(e) ? "D  " : "F  ");
-                uart_print(name);
-                if (!dirent_is_dir(e)) {
-                    uart_print("  (");
-                    uart_print_hex(rd32(&e[28]));
-                    uart_print(" octets)");
-                }
-                uart_print(dirent_is_dir(e) ? "/\n" : "\n");
+                path_list_add(&pl, path, name, (uint32_t)strlen(name));
             }
         }
         uint32_t next = fat_get(c);
@@ -1145,6 +1143,13 @@ int fat32_ls(const char *path) {
         c = next;
     }
 
+    done:
     spinlock_release(&fat32_lock);
-    return FAT32_OK;
+    r = path_list_finish(&pl, out);
+    return r < 0 ? FAT32_ERR_NOSPC : r;
+
+    fail:
+    spinlock_release(&fat32_lock);
+    path_list_discard(&pl);
+    return r;
 }

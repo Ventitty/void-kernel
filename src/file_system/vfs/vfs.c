@@ -202,36 +202,49 @@ int vfs_unlink(const char *path) {
     return ram_fs_unlink(path);
 }
 
-int vfs_ls(const char *path) {
+/* Ajoute à pl les chemins d'une liste renvoyée par un ls, puis la libère. */
+static void merge(path_list_t *pl, char **list) {
+    for (uint32_t i = 0; list && list[i]; i++) path_list_add_path(pl, list[i]);
+    path_list_free(list);
+}
+
+int vfs_ls(const char *path, char ***out) {
+    *out = NULL;
     if (!is_valid(path)) return -1;
 
+    path_list_t pl;
+    path_list_init(&pl);
+    char **sub = NULL;
+
     if (is_root(path)) {
-        uart_print("D  dev/\n");
-        uart_print("D  tmp/\n");
-        if (!fat32_is_mounted()) {
-            uart_print("   (carte SD non montee)\n");
-            return 0;
+        /* Points de montage, puis la racine de la carte si elle est montée. */
+        path_list_add_path(&pl, "/dev");
+        path_list_add_path(&pl, "/tmp");
+        if (fat32_is_mounted()) {
+            if (fat32_ls("/", &sub) < 0) { path_list_discard(&pl); return -1; }
+            merge(&pl, sub);
         }
-        return fat32_ls("/");
+        return path_list_finish(&pl, out);
     }
 
-    if (strcmp(path, "/dev") == 0) {
+    if (strcmp(path, "/dev") == 0 || strcmp(path, "/dev/") == 0) {
+        /* Périphériques, puis ce que ramfs contient dans /dev. */
         spinlock_acquire(&dev_lock);
-        vfs_dev_t *d = dev_list;
-        spinlock_release(&dev_lock);
-        for (; d; d = d->next) {
-            uart_print("C  ");
-            uart_print(d->name);
-            uart_print("\n");
+        for (vfs_dev_t *d = dev_list; d; d = d->next) {
+            path_list_add(&pl, path, d->name, (uint32_t)strlen(d->name));
         }
-        return ram_fs_ls(path);
+        spinlock_release(&dev_lock);
+        if (ram_fs_ls(path, &sub) < 0) { path_list_discard(&pl); return -1; }
+        merge(&pl, sub);
+        return path_list_finish(&pl, out);
     }
 
     if (is_ram_path(path)) {
         if (dev_shadows(path)) return -1;
-        return ram_fs_ls(path);
+        return ram_fs_ls(path, out);
     }
-    return fat32_ls(path);
+    int n = fat32_ls(path, out);
+    return n < 0 ? -1 : n;
 }
 
 int vfs_mknod(const char *path, vfs_dev_read_t read, vfs_dev_write_t write) {

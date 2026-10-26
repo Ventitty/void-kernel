@@ -90,7 +90,7 @@ static int test_relire(const char *chemin, char *buf, uint32_t max) {
 
 static void test_ecriture_fichier(void) {
     static const char ligne1[] = "Bonjour depuis voidOS !\n";
-    static const char ligne2[] = "Deuxieme ligne, ajoutee en fin de test test test test fichier.\n";
+    static const char ligne2[] = "Deuxieme ligne, ajoutee en fin de fichier.\n";
     static char lu[128];
     uint32_t taille = 0;
 
@@ -133,8 +133,16 @@ static void test_ecriture_fichier(void) {
         uart_print("  contenu de " TEST_FICHIER " :\n");
         uart_print(lu);
     }
-    uart_print("  racine de la carte :\n");
-    vfs_ls("/");
+    uart_print("  contenu de / :\n");
+    char **liste;
+    int nb = vfs_ls("/", &liste);
+    test_resultat(nb >= 3, "vfs_ls(\"/\")");
+    for (int i = 0; i < nb; i++) {
+        uart_print("    ");
+        uart_print(liste[i]);
+        uart_print(vfs_is_dir(liste[i]) ? "/\n" : "\n");
+    }
+    path_list_free(liste);
 
     uart_print("  bilan : ");
     test_print_dec((uint32_t)test_ok_count);

@@ -70,7 +70,11 @@ int vfs_mkdir(const char *path);
 int vfs_mkdir_p(const char *path);
 int vfs_rmdir(const char *path);
 int vfs_unlink(const char *path);
-int vfs_ls(const char *path);
+/* Chemins complets de tout ce que contient le dossier path (fichiers,
+ * dossiers, périphériques ; pour "/" aussi les points de montage /dev et
+ * /tmp), dans *out : tableau de chaînes terminé par NULL, en un seul bloc,
+ * à libérer avec path_list_free. Retourne leur nombre, ou -1. */
+int vfs_ls(const char *path, char ***out);
 
 /* Crée sous /dev un fichier dont vfs_read et vfs_write appellent read et
  * write. L'un des deux peut être NULL (périphérique en lecture ou en

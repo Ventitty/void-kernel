@@ -74,7 +74,10 @@ static ram_fs_node_t *find_node(const char *path) {
     const char *name;
     uint32_t len;
     ram_fs_node_t *parent = resolve_parent(path, &name, &len);
-    if (!parent || len == 0) return NULL;
+    if (!parent) return NULL;
+
+    /* "/tmp/D/" : le "/" final désigne le dossier D lui-même. */
+    if (len == 0) return parent;
 
     return find_child(parent, name, len);
 }
@@ -335,7 +338,11 @@ int ram_fs_exists(const char *path) {
     return ok;
 }
 
-int ram_fs_ls(const char *path) {
+int ram_fs_ls(const char *path, char ***out) {
+    *out = NULL;
+    path_list_t pl;
+    path_list_init(&pl);
+
     spinlock_acquire(&ram_fs_lock);
 
     ram_fs_node_t *dir = find_node(path);
@@ -343,23 +350,12 @@ int ram_fs_ls(const char *path) {
         spinlock_release(&ram_fs_lock);
         return -1;
     }
-
     for (ram_fs_node_t *c = dir->first_child; c; c = c->next_sibling) {
-        if (c->type == RAM_FS_TYPE_DIR) {
-            uart_print("D  ");
-            uart_print(c->name);
-            uart_print("/\n");
-        } else {
-            uart_print("F  ");
-            uart_print(c->name);
-            uart_print("  (");
-            uart_print_hex(c->size);
-            uart_print(" octets)\n");
-        }
+        path_list_add(&pl, path, c->name, (uint32_t)strlen(c->name));
     }
 
     spinlock_release(&ram_fs_lock);
-    return 0;
+    return path_list_finish(&pl, out);
 }
 
 static void print_node_recursive(ram_fs_node_t *node, int depth) {

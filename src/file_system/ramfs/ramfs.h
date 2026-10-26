@@ -5,6 +5,7 @@
 #include "src/memory_manager/memory.h"
 #include "src/utils/utils.h"
 #include "src/scheduler/spinlock.h"
+#include "src/file_system/path_list/path_list.h"
 
 #define RAM_FS_MAX_NAME 32
 
@@ -65,7 +66,10 @@ int ram_fs_rmdir(const char *path);
 
 int ram_fs_is_dir(const char *path);
 int ram_fs_exists(const char *path);
-int ram_fs_ls(const char *path);
+/* Chemins complets des entrées (fichiers et dossiers) du dossier path,
+ * dans *out (voir path_list.h, à libérer avec path_list_free). Retourne
+ * leur nombre, ou -1 si path n'est pas un dossier ou si la mémoire manque. */
+int ram_fs_ls(const char *path, char ***out);
 
 void ram_fs_print_tree(void);
 

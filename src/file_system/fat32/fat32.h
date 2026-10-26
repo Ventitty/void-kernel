@@ -6,6 +6,7 @@
 #include "src/memory_manager/memory.h"
 #include "src/utils/utils.h"
 #include "src/scheduler/spinlock.h"
+#include "src/file_system/path_list/path_list.h"
 
 /* ---------------------------------------------------------------------------
  * FAT32 sur carte SD : lecture et écriture.
@@ -120,7 +121,10 @@ int fat32_mkdir(const char *path);
 /* Supprime un dossier vide. 0, ou FAT32_ERR_* (NOTEMPTY s'il ne l'est pas). */
 int fat32_rmdir(const char *path);
 
-/* Affiche le contenu d'un dossier sur la console. 0, ou FAT32_ERR_*. */
-int fat32_ls(const char *path);
+/* Chemins complets des entrées (fichiers et dossiers, sans "." ni "..")
+ * du dossier path, dans *out (voir path_list.h, à libérer avec
+ * path_list_free). Les noms sont les noms courts 8.3. Retourne leur
+ * nombre, ou FAT32_ERR_* (NOTDIR, NOENT... ; NOSPC si la mémoire manque). */
+int fat32_ls(const char *path, char ***out);
 
 #endif /* FAT32_H */
